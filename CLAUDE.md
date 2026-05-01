@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-A web app that syncs a chosen Spotify playlist to a chosen YouTube playlist on demand ("Sync Now" button). One-way Spotify → YouTube only in MVP. Personal/small-multi-user; deployed entirely on free tiers (Vercel Hobby + Neon Free).
+A web app that **bidirectionally** syncs a chosen Spotify playlist with a chosen YouTube playlist on demand ("Sync Now" button). A track added on either side propagates to the other; a track removed from either side propagates the removal. Convergence is per-press, not continuous. Personal/small-multi-user; deployed entirely on free tiers (Vercel Hobby + Neon Free).
+
+> **Current implementation state:** the M0–M9 build (commits `d55f6c5`..`3bde157`) ships the one-way Spotify → YouTube path, additive only. Two-way semantics — reverse adds, removals on either side, and delta detection against a stored baseline — are **planned but not yet built**. Sections marked *(planned)* below describe the target; sections without that marker describe what's in main today.
 
 The full revised spec lives at `/Users/aayzaahmed/.claude/plans/review-this-plan-in-federated-shell.md`. This document is the implementation reference: the plan tells you *what* to build, this tells you *how the system fits together* and *which constraints are non-negotiable*.
 
@@ -13,10 +15,11 @@ The full revised spec lives at `/Users/aayzaahmed/.claude/plans/review-this-plan
 These are not preferences. Violating them means the app fails or violates provider policy. Whenever you change architecture, sanity-check against this list.
 
 1. **YouTube Data API quota is 10,000 units/day** (resets 00:00 America/Los_Angeles, not UTC).
-   - `search.list` = 100 units. `playlistItems.insert` = 50 units. `playlistItems.list` = 1 unit/page. `videos.list` = 1 unit per call (up to 50 IDs).
+   - `search.list` = 100 units. `playlistItems.insert` = 50 units. `playlistItems.delete` = 50 units. `playlistItems.list` = 1 unit/page. `videos.list` = 1 unit per call (up to 50 IDs).
    - A naive 100-track first sync = ~15,000 units → blown quota mid-sync.
    - Mitigations baked in: (a) `track_mappings` cache checked before every `search.list`, (b) ISRC-based join short-circuits search entirely when both sides expose it, (c) `videos.list` batched (50 IDs/call) for duration scoring instead of re-searching, (d) `quota_usage` table guards every call, (e) on `403 quotaExceeded` the run flips to `paused_quota` and resumes after midnight Pacific.
    - **Never add a code path that calls `search.list` without first checking `track_mappings`.**
+   - *(planned, two-way)* Two-way doesn't worsen the worst case: only items new to YouTube cost search/insert; items new to Spotify only cost Spotify-side calls (Spotify is rate-limited but has no daily quota cap). Delta-based steady-state syncs are the *cheap* case — only changes since the last baseline cost any quota.
 
 2. **Vercel Hobby = 10 seconds per serverless function invocation.** Fluid Compute can extend to 60s but the function still must return; do not assume it.
    - A 100-track sync doing sequential YouTube searches + inserts is ~30s minimum. Single-shot sync will 504 mid-flight and corrupt state.
@@ -44,7 +47,7 @@ Next.js App Router on Vercel
   ├── app/api/connect/{spotify,youtube}   ← provider OAuth, writes connected_accounts
   ├── app/api/playlists/{spotify,youtube} ← uses getValidAccessToken
   ├── app/api/playlist-pairs              ← CRUD on playlist_pairs
-  ├── app/api/sync/[pairId]               ← plans run, returns runId
+  ├── app/api/sync/[pairId]               ← plans a 2-way diff vs baseline (planned)
   ├── app/api/sync/[pairId]/step          ← processes one chunk per invocation
   └── app/dashboard                       ← UI: connect, pick, pair, sync, history
         │
@@ -53,6 +56,10 @@ Next.js App Router on Vercel
   │
   ▼  drizzle + @neondatabase/serverless (HTTP)
 Neon Postgres
+   │
+   └─ playlist_pairs.last_known_* JSONB ← per-pair baseline snapshot (planned)
+       written at end of every successful run; consulted by next planRun
+       to compute deltas on each side instead of re-scanning everything.
 ```
 
 App-level identity is **Auth.js** (NextAuth) with the Google provider, Drizzle adapter, sessions in Postgres. Auth.js owns `users` / `accounts` / `sessions` / `verification_tokens`.
@@ -71,22 +78,26 @@ Schema definition lives in `db/schema.ts` (Drizzle). The full DDL is in the plan
 - **`sync_run_items`** — one row per planned operation in a run (action: `add | remove | skip`, status: `pending | done | failed`, optional `youtube_video_id`). Lets `/step` resume after a timeout, refresh, or partial failure.
 - **`unmatched_tracks`** — tracks below the 0.75 confidence threshold. Stores top-3 candidates as JSON for a future "fix matches" UI. **Never auto-add anything below threshold** — it lands here instead.
 - **`quota_usage`** — `(date, units_used)` keyed in Pacific time. Every YouTube call increments it; every run pre-checks remaining budget.
-- **`playlist_pairs`** — Spotify ↔ YouTube playlist pairing. `mode` is per-call (no `default_sync_mode` column). `broken=true` if either playlist 404s.
+- **`playlist_pairs`** — Spotify ↔ YouTube playlist pairing. `broken=true` if either playlist 404s. *(planned)* Adds `last_synced_at`, `last_known_spotify_track_ids` (jsonb `string[]`), and `last_known_youtube_items` (jsonb `[{videoId, playlistItemId}]`) — the per-pair baseline that `planRun` diffs against. The baseline is written at end-of-run only when `status=done`; `paused_quota` and `failed` runs leave it untouched so the next attempt starts from the same reference point.
 
 ## Sync state machine
 
+State graph is the same in both directions:
+
 ```
 sync_runs.status:
-   pending  ──► running  ──► done
+   pending  ──► running  ──► done   (writes new baseline)
        │          │  ▲         ▲
        ▼          │  └─ /step processes batches ─┐
    (planRun       │                              │
     fills         │                              │
     sync_run_items)                              │
                   │                              │
-                  ├─► paused_quota  (resume next day)
-                  └─► failed       (terminal — surface error to user)
+                  ├─► paused_quota  (resume next day, baseline not updated)
+                  └─► failed       (terminal — surface error, baseline not updated)
 ```
+
+### Current implementation: one-way, additive only
 
 `planRun(pairId, userId)`:
 1. Fetch both playlists fully (paginated reads).
@@ -106,6 +117,52 @@ sync_runs.status:
 6. Update `sync_runs` counters and `quota_units_spent`.
 7. On `403 quotaExceeded` → `status = paused_quota`. On `429` → backoff and continue if budget allows. On other errors → mark item failed, continue.
 8. Return `{processed, remaining, quotaRemainingToday, status}`.
+
+### Planned: two-way delta-based sync
+
+The shape is unchanged (planRun → multiple stepRun calls → done) but the body of `planRun` and the action vocabulary expand.
+
+`sync_run_items.action` (planned) becomes one of:
+
+```
+add_to_yt    | add_to_sp    | remove_from_yt    | remove_from_sp    | skip
+```
+
+Each item names *one operation on one provider*; a single Spotify track that needs both directions is impossible by construction.
+
+`planRun` algorithm (planned):
+
+1. Read pair's baseline: `sp_baseline = pair.last_known_spotify_track_ids ?? []`, `yt_baseline = pair.last_known_youtube_items ?? []`.
+2. Fetch both playlists fully (paginated reads). Build `sp_now: Set<spotifyTrackId>` and `yt_now: Map<videoId, playlistItemId>`.
+3. **Compute deltas per side** vs baseline:
+   - `sp_added = sp_now - sp_baseline`
+   - `sp_removed = sp_baseline - sp_now`
+   - `yt_added = yt_now.keys - yt_baseline.videoIds`
+   - `yt_removed = yt_baseline.videoIds - yt_now.keys`
+4. **First-time sync (no baseline):** treat `sp_baseline = ∅`, `yt_baseline = ∅`. Result: `sp_added = sp_now`, `yt_added = yt_now`, no removals. This is the *union* — every track on either side gets propagated to the other. Document the soft-cap of ~150 total tracks for first sync (quota).
+5. **Conflict resolution** (deterministic, no surprises):
+   - For each Spotify track in `sp_removed`, look up its mapping → if the mapped `videoId` is in `yt_added` for *this* run, treat as a re-add: drop from removal list, also drop from `yt_added` to avoid duplicate insert. **Adds win over removes**, on either side.
+   - Same logic mirrored: a `yt_removed` whose Spotify counterpart appears in `sp_added` is collapsed.
+6. **Generate operations**:
+   - For each `track_id ∈ sp_added`: emit `add_to_yt` (resolve videoId now from `track_mappings`/ISRC, else null → step-time search).
+   - For each `track_id ∈ sp_removed`: look up its mapping; if it points to a `videoId` still in `yt_now`, emit `remove_from_yt` carrying that `playlistItemId`. If no mapping or videoId already absent on YT, emit `skip` with reason `unmappable_removal`.
+   - For each `videoId ∈ yt_added`: emit `add_to_sp` (resolve `spotify_track_id` now from a reverse lookup against `track_mappings(user_id, youtube_video_id)`; else null → step-time Spotify search).
+   - For each `videoId ∈ yt_removed`: look up its mapping; if a `spotify_track_id` is still in `sp_now`, emit `remove_from_sp`. Else `skip`.
+7. Insert `sync_runs` (status=`pending`) and the `sync_run_items` rows with their action types. Return `{runId, plannedAdds, plannedRemoves, plannedSkips, plannedQuotaUnits}` — counters now sum across both directions.
+
+`stepRun` algorithm (planned): same wall + quota budget. Per item, dispatch on `action`:
+
+- **add_to_yt**: identical to today's resolve-or-search path; on success, persist `track_mappings`, insert via `playlistItems.insert`.
+- **add_to_sp**: if `spotify_track_id` known, `playlist_add_items` directly. Else `searchTracks(query)` against Spotify → score with the existing matcher (it's symmetric) → if ≥ 0.75 add and persist mapping; else `unmatched_tracks`. **No quota cost on the YouTube side for this branch.** Spotify search is rate-limited, not quota-limited.
+- **remove_from_yt**: `playlistItems.delete(playlistItemId)`. Costs 50 units.
+- **remove_from_sp**: `playlist_remove_items` with `{tracks: [{uri, positions}]}`.
+- **skip**: write `done` with no provider call.
+
+On terminal `done`, write the new baseline to `playlist_pairs` *atomically with* the run-status update — same transaction, so a crashed step never leaves a stale baseline next to a marked-done run.
+
+### Why not propagate deletes by absence-of-mapping?
+
+The whole reason we need a baseline: a track present on Spotify and absent from YouTube means *either* (a) it was just added on Spotify and needs to be added on YouTube, *or* (b) it was just removed from YouTube and needs to be removed from Spotify. Without a snapshot of last-time's state, those are indistinguishable, and you'd either spam re-adds or silently drop user removals.
 
 ## Track matching
 
@@ -138,6 +195,14 @@ type NormalizedTrack = {
 ```
 
 `sourcePlaylistItemId` is critical: YouTube removes by `playlistItem.id` (a synthetic per-membership ID), not by videoId. Without it, removals 404. Capture it on every `playlistItems.list` page.
+
+### Reverse direction *(planned, two-way)*
+
+`matchYouTubeToSpotify(yt_track, candidates)` reuses the same `scoreCandidate` function — title+artist+duration scoring is symmetric. Differences from the forward path:
+
+- Candidates come from `spotify.searchTracks(query)` instead of `youtube.searchVideos(query)`. Spotify search has rate limits but no daily quota cap, so the reverse direction is essentially "free" relative to the YouTube quota budget.
+- Spotify's results expose ISRC and a clean artist array, so artist Jaccard is more reliable than the forward direction (where YouTube gives only one `channelTitle` string).
+- Reverse cache hit: a second-direction lookup on `track_mappings` keyed by `youtube_video_id`. The schema migration for two-way adds an index on `(user_id, youtube_video_id)` so this lookup stays fast.
 
 ## OAuth flow specifics
 
@@ -225,6 +290,10 @@ If the app is scaffolded but these scripts are missing, add them to `package.jso
 - **Using `@supabase/supabase-js` because some snippet referenced it.** This stack is Neon + Drizzle + Auth.js. No Supabase.
 - **Skipping `access_type=offline` on Google OAuth.** First connect works, second doesn't, and you'll spend an hour figuring out why.
 - **Lowercasing-and-dashing `${title}-${artist}` as a match key.** This is what the original spec proposed and what we explicitly rejected. Use the full normalize+fuzzy+ISRC pipeline.
+- *(planned, two-way)* **Updating the baseline before the run is `done`.** A `paused_quota` or `failed` run that updates the baseline will misclassify later additions/removals as in-baseline. Baseline write must be atomic with `status=done`, in the same transaction.
+- *(planned, two-way)* **Treating absence of mapping as "removed."** A track present on Spotify with no `track_mappings` row could be brand-new on Spotify *or* a track we never managed to match. Only the **baseline** distinguishes these. Don't infer removal from absence of mapping.
+- *(planned, two-way)* **Conflict policy ambiguity.** When the same track appears in both `sp_added` and `yt_removed` (or vice versa), the rule is unconditional: **adds win, removes lose**, on either side. Document this loudly when it surfaces in the UI ("preserved on both sides").
+- *(planned, two-way)* **Re-using `track_mappings` for reverse lookups without an index.** A `(user_id, spotify_track_id)` PK doesn't help when querying by `youtube_video_id`. Add the `(user_id, youtube_video_id)` index in the migration that introduces two-way; without it the reverse lookup degrades to a table scan per item.
 
 ## Where to look first when debugging
 
