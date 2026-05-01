@@ -9,5 +9,11 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    // Module-level imports of db/client.ts throw if this is missing. Tests
+    // that actually use the DB are integration tests (not yet present);
+    // unit tests transitively import the module but never execute queries.
+    env: {
+      NEON_DATABASE_URL: "postgres://placeholder@example.invalid/db",
+    },
   },
 });
