@@ -187,6 +187,23 @@ describe("YouTubeClient quota and error handling", () => {
     );
   });
 
+  it("createPlaylist POSTs with snippet+status and charges 50 units", async () => {
+    const { fn, calls } = mockFetch([
+      { status: 200, body: { id: "PL-new" } },
+    ]);
+    const q = new InMemoryQuotaAccounter();
+    const c = new YouTubeClient(token, q, fn);
+    const id = await c.createPlaylist("My Synced Playlist");
+    expect(id).toBe("PL-new");
+    expect(q.used).toBe(50);
+    expect(calls[0].url).toContain("/playlists?part=snippet%2Cstatus");
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect(body).toEqual({
+      snippet: { title: "My Synced Playlist" },
+      status: { privacyStatus: "private" },
+    });
+  });
+
   it("addToPlaylist charges 50 units on success", async () => {
     const { fn } = mockFetch([
       { status: 200, body: { id: "newPlaylistItemId" } },

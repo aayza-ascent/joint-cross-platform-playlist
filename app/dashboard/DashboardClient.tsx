@@ -46,6 +46,10 @@ export default function DashboardClient(props: {
   const [selectedYt, setSelectedYt] = useState<string | null>(null);
   const [creatingPair, setCreatingPair] = useState(false);
 
+  const [mirrorName, setMirrorName] = useState("");
+  const [creatingMirror, setCreatingMirror] = useState(false);
+  const [mirrorError, setMirrorError] = useState<string | null>(null);
+
   const [syncByPair, setSyncByPair] = useState<Record<string, SyncProgress>>(
     {},
   );
@@ -111,6 +115,35 @@ export default function DashboardClient(props: {
       alert(formatError(err));
     } finally {
       setCreatingPair(false);
+    }
+  }
+
+  async function createMirror() {
+    if (!mirrorName.trim()) return;
+    setCreatingMirror(true);
+    setMirrorError(null);
+    try {
+      const res = await fetch("/api/playlist-pairs/mirror", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: mirrorName.trim() }),
+      });
+      const json = await handleApi<{ pair: PairRow }>(res);
+      setPairs((ps) => [json.pair, ...ps.filter((p) => p.id !== json.pair.id)]);
+      setMirrorName("");
+      // Refresh playlist lists so the new playlists appear with their proper
+      // names on the pair card (the lookup maps power both pickers and the
+      // pair-card title rendering).
+      const [sp, yt] = await Promise.all([
+        fetch("/api/playlists/spotify").then(handleApi<{ playlists: SpPlaylist[] }>),
+        fetch("/api/playlists/youtube").then(handleApi<{ playlists: YtPlaylist[] }>),
+      ]);
+      setSpPlaylists(sp.playlists);
+      setYtPlaylists(yt.playlists);
+    } catch (err) {
+      setMirrorError(formatError(err));
+    } finally {
+      setCreatingMirror(false);
     }
   }
 
@@ -232,6 +265,16 @@ export default function DashboardClient(props: {
       />
 
       {bothConnected && (
+        <MirrorCreator
+          name={mirrorName}
+          onName={setMirrorName}
+          onCreate={createMirror}
+          creating={creatingMirror}
+          error={mirrorError}
+        />
+      )}
+
+      {bothConnected && (
         <PairCreator
           loading={loadingPlaylists}
           error={playlistsError}
@@ -319,6 +362,48 @@ function ConnectButton(props: {
       <span className="text-sm">{props.label}</span>
       <span className="text-xs text-neutral-400">Connect →</span>
     </a>
+  );
+}
+
+function MirrorCreator(props: {
+  name: string;
+  onName: (v: string) => void;
+  onCreate: () => void;
+  creating: boolean;
+  error: string | null;
+}) {
+  return (
+    <section className="rounded-lg border border-neutral-800 p-5 space-y-3">
+      <div className="flex items-baseline justify-between gap-3 flex-wrap">
+        <h2 className="font-medium">Create a fresh paired playlist</h2>
+        <p className="text-xs text-neutral-500">
+          Skip picking — we&apos;ll create a private playlist on each side with
+          this name and pair them.
+        </p>
+      </div>
+      {props.error && (
+        <div className="text-sm text-rose-300 bg-rose-950/30 border border-rose-900 rounded-md px-3 py-2">
+          {props.error}
+        </div>
+      )}
+      <div className="flex flex-col sm:flex-row gap-3">
+        <input
+          type="text"
+          value={props.name}
+          onChange={(e) => props.onName(e.target.value)}
+          placeholder="Playlist name (e.g. My Sync)"
+          maxLength={80}
+          className="flex-1 rounded-md bg-neutral-900 border border-neutral-800 px-3 py-2 text-sm placeholder:text-neutral-500 focus:outline-none focus:border-neutral-600"
+        />
+        <button
+          disabled={!props.name.trim() || props.creating}
+          onClick={props.onCreate}
+          className="rounded-md bg-emerald-500 disabled:bg-neutral-700 disabled:text-neutral-400 text-neutral-950 px-4 py-2 text-sm font-medium hover:bg-emerald-400 transition"
+        >
+          {props.creating ? "Creating…" : "Create paired playlists"}
+        </button>
+      </div>
+    </section>
   );
 }
 

@@ -87,6 +87,28 @@ export class SpotifyClient {
       }));
   }
 
+  async getCurrentUserId(): Promise<string> {
+    const me: { id: string } = await this.request("GET", `${SPOTIFY_API}/me`);
+    return me.id;
+  }
+
+  async createPlaylist(
+    name: string,
+    opts: { description?: string; isPublic?: boolean } = {},
+  ): Promise<string> {
+    const userId = await this.getCurrentUserId();
+    const json: { id: string } = await this.request(
+      "POST",
+      `${SPOTIFY_API}/users/${encodeURIComponent(userId)}/playlists`,
+      {
+        name,
+        public: opts.isPublic ?? false,
+        ...(opts.description && { description: opts.description }),
+      },
+    );
+    return json.id;
+  }
+
   async addTracks(playlistId: string, uris: string[]): Promise<void> {
     if (uris.length === 0) return;
     const calls: Array<Promise<unknown>> = [];

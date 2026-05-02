@@ -110,6 +110,20 @@ export class YouTubeClient {
     return out;
   }
 
+  async createPlaylist(title: string): Promise<string> {
+    const url = buildUrl(`${YT_API}/playlists`, { part: "snippet,status" });
+    const json: { id: string } = await this.request(
+      "POST",
+      url,
+      {
+        snippet: { title },
+        status: { privacyStatus: "private" },
+      },
+      50,
+    );
+    return json.id;
+  }
+
   async addToPlaylist(playlistId: string, videoId: string): Promise<string> {
     const url = buildUrl(`${YT_API}/playlistItems`, { part: "snippet" });
     const json: { id: string } = await this.request(

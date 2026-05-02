@@ -308,6 +308,42 @@ describe("SpotifyClient", () => {
     expect(calls[2].url).toMatch(/[?&]limit=1\b/);
   });
 
+  it("createPlaylist resolves user_id from /me then POSTs to /users/:id/playlists", async () => {
+    const { fn, calls } = mockFetch([
+      { status: 200, body: { id: "user-abc" } },
+      { status: 201, body: { id: "new-playlist-id" } },
+    ]);
+    const c = new SpotifyClient(tokenProvider, fn);
+    const id = await c.createPlaylist("Test Sync", {
+      description: "made by app",
+    });
+    expect(id).toBe("new-playlist-id");
+    expect(fn).toHaveBeenCalledTimes(2);
+    expect(calls[0].url).toContain("/v1/me");
+    expect(calls[0].init?.method).toBe("GET");
+    expect(calls[1].url).toContain(
+      "/v1/users/user-abc/playlists",
+    );
+    expect(calls[1].init?.method).toBe("POST");
+    const body = JSON.parse(calls[1].init?.body as string);
+    expect(body).toMatchObject({
+      name: "Test Sync",
+      public: false,
+      description: "made by app",
+    });
+  });
+
+  it("createPlaylist defaults to private and omits description if not given", async () => {
+    const { fn, calls } = mockFetch([
+      { status: 200, body: { id: "user-abc" } },
+      { status: 201, body: { id: "p-x" } },
+    ]);
+    const c = new SpotifyClient(tokenProvider, fn);
+    await c.createPlaylist("X");
+    const body = JSON.parse(calls[1].init?.body as string);
+    expect(body).toEqual({ name: "X", public: false });
+  });
+
   it("searchTracks retries on 429 honoring Retry-After", async () => {
     const { fn } = mockFetch([
       { status: 429, headers: { "retry-after": "0" } },
