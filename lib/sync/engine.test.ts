@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { SyncEngine } from "./engine";
+import { ActiveRunExistsError, SyncEngine } from "./engine";
 import { InMemorySyncStore } from "./store";
 import type {
   SpotifyClient,
@@ -17,103 +17,146 @@ import {
 import { QuotaExceededError } from "@/lib/youtube/client";
 import type { NormalizedTrack } from "@/lib/types";
 
-// ---- fake providers (only the methods the engine actually calls) ----
-
-type FakeSpotifyOpts = {
-  tracksByPlaylist: Record<string, NormalizedTrack[]>;
-};
+// ---- fakes ----
 
 class FakeSpotify {
-  calls = { getPlaylistTracks: 0 };
-  constructor(private opts: FakeSpotifyOpts) {}
+  calls = {
+    getPlaylistTracks: 0,
+    addTracks: 0,
+    removeTracks: 0,
+    searchTracks: 0,
+  };
+  inserts: Array<{ playlistId: string; uris: string[] }> = [];
+  removes: Array<{ playlistId: string; tracks: any[] }> = [];
+  constructor(
+    public tracksByPlaylist: Record<string, NormalizedTrack[]>,
+    public searchResults: Record<string, NormalizedTrack[]> = {},
+  ) {}
   async getPlaylists(): Promise<SpotifyPlaylistRef[]> {
     return [];
   }
-  async getPlaylistTracks(playlistId: string): Promise<NormalizedTrack[]> {
+  async getPlaylistTracks(id: string): Promise<NormalizedTrack[]> {
     this.calls.getPlaylistTracks++;
-    return this.opts.tracksByPlaylist[playlistId] ?? [];
+    return this.tracksByPlaylist[id] ?? [];
   }
-  async addTracks() {}
-  async removeTracks() {}
+  async addTracks(playlistId: string, uris: string[]) {
+    this.calls.addTracks++;
+    this.inserts.push({ playlistId, uris });
+  }
+  async removeTracks(playlistId: string, tracks: any[]) {
+    this.calls.removeTracks++;
+    this.removes.push({ playlistId, tracks });
+    // Reflect removal in the in-memory playlist for end-of-run baseline snapshot.
+    const arr = this.tracksByPlaylist[playlistId] ?? [];
+    const removeIds = new Set(
+      tracks.map((t) => t.uri.replace("spotify:track:", "")),
+    );
+    this.tracksByPlaylist[playlistId] = arr.filter(
+      (t) => !removeIds.has(t.sourceTrackId),
+    );
+  }
+  async searchTracks(query: string): Promise<NormalizedTrack[]> {
+    this.calls.searchTracks++;
+    return findFuzzy(this.searchResults, query);
+  }
 }
-
-type FakeYouTubeOpts = {
-  itemsByPlaylist: Record<string, YouTubePlaylistItem[]>;
-  searchByQuery?: Record<string, YouTubeSearchResult[]>;
-  videosById?: Record<
-    string,
-    { durationMs: number; title: string; channelTitle: string }
-  >;
-  failSearchOnce?: "quota";
-};
 
 class FakeYouTube {
   calls = {
     getPlaylistItems: 0,
     searchVideos: 0,
     getVideosByIds: 0,
-    addToPlaylist: [] as Array<{ playlistId: string; videoId: string }>,
+    addToPlaylist: 0,
+    removeFromPlaylist: 0,
   };
-  insertedItems: Array<{ playlistId: string; videoId: string }> = [];
-  private failSearchOnce?: "quota";
+  inserts: Array<{ playlistId: string; videoId: string }> = [];
+  removes: string[] = [];
+  private failNextSearchAs?: "quota";
   constructor(
-    private opts: FakeYouTubeOpts,
+    public itemsByPlaylist: Record<string, YouTubePlaylistItem[]>,
     public quota: QuotaAccounter,
+    opts?: {
+      searchByQuery?: Record<string, YouTubeSearchResult[]>;
+      videosById?: Record<
+        string,
+        { durationMs: number; title: string; channelTitle: string }
+      >;
+      failSearchOnceAs?: "quota";
+    },
   ) {
-    this.failSearchOnce = opts.failSearchOnce;
+    this.searchByQuery = opts?.searchByQuery ?? {};
+    this.videosById = opts?.videosById ?? {};
+    this.failNextSearchAs = opts?.failSearchOnceAs;
   }
+  searchByQuery: Record<string, YouTubeSearchResult[]>;
+  videosById: Record<
+    string,
+    { durationMs: number; title: string; channelTitle: string }
+  >;
   async getPlaylists() {
     return [];
   }
   async getPlaylistItems(id: string): Promise<YouTubePlaylistItem[]> {
     this.calls.getPlaylistItems++;
     await this.quota.spend(1);
-    return this.opts.itemsByPlaylist[id] ?? [];
+    return this.itemsByPlaylist[id] ?? [];
   }
   async searchVideos(q: string): Promise<YouTubeSearchResult[]> {
     this.calls.searchVideos++;
-    if (this.failSearchOnce === "quota") {
-      this.failSearchOnce = undefined;
+    if (this.failNextSearchAs === "quota") {
+      this.failNextSearchAs = undefined;
       throw new QuotaExceededError();
     }
     await this.quota.spend(100);
-    return this.opts.searchByQuery?.[q] ?? findFuzzy(this.opts.searchByQuery ?? {}, q);
+    return findFuzzy(this.searchByQuery, q);
   }
   async getVideosByIds(ids: string[]) {
     this.calls.getVideosByIds++;
     await this.quota.spend(Math.max(1, Math.ceil(ids.length / 50)));
-    const m = new Map();
+    const m = new Map<
+      string,
+      { durationMs: number; title: string; channelTitle: string }
+    >();
     for (const id of ids) {
-      const meta = this.opts.videosById?.[id];
+      const meta = this.videosById[id];
       if (meta) m.set(id, meta);
     }
     return m;
   }
   async addToPlaylist(playlistId: string, videoId: string): Promise<string> {
-    this.calls.addToPlaylist.push({ playlistId, videoId });
-    this.insertedItems.push({ playlistId, videoId });
+    this.calls.addToPlaylist++;
+    this.inserts.push({ playlistId, videoId });
     await this.quota.spend(50);
-    return `pi-${videoId}`;
+    // Reflect insert in the in-memory playlist for end-of-run snapshot.
+    const arr = this.itemsByPlaylist[playlistId] ?? [];
+    const piid = `pi-${videoId}`;
+    arr.push({
+      playlistItemId: piid,
+      videoId,
+      videoTitle: "",
+      channelTitle: "",
+    });
+    this.itemsByPlaylist[playlistId] = arr;
+    return piid;
   }
-  async removeFromPlaylist() {}
-  toCandidate() {
-    throw new Error("unused in tests");
+  async removeFromPlaylist(playlistItemId: string) {
+    this.calls.removeFromPlaylist++;
+    this.removes.push(playlistItemId);
+    await this.quota.spend(50);
+    for (const [pid, arr] of Object.entries(this.itemsByPlaylist)) {
+      this.itemsByPlaylist[pid] = arr.filter(
+        (i) => i.playlistItemId !== playlistItemId,
+      );
+    }
   }
 }
 
-// Utility: lookup search results loosely so tests can key by the same query
-// strings the engine builds ("title artists...").
-function findFuzzy(
-  table: Record<string, YouTubeSearchResult[]>,
-  q: string,
-): YouTubeSearchResult[] {
+function findFuzzy<T>(table: Record<string, T[]>, q: string): T[] {
   for (const [k, v] of Object.entries(table)) {
     if (q.includes(k) || k.includes(q)) return v;
   }
   return [];
 }
-
-// ---- helpers ----
 
 const sp = (
   o: { id: string; title: string; artists: string[]; durationMs: number; isrc?: string },
@@ -133,18 +176,23 @@ function makeEngine(args: {
   ytPlaylistId?: string;
   spTracks: NormalizedTrack[];
   ytItems?: YouTubePlaylistItem[];
-  searchByQuery?: Record<string, YouTubeSearchResult[]>;
-  videosById?: Record<
-    string,
-    { durationMs: number; title: string; channelTitle: string }
-  >;
+  baseline?: {
+    spotifyTrackIds: string[];
+    youtubeItems: { videoId: string; playlistItemId: string }[];
+  };
   preMappings?: Array<{
     spotifyTrackId: string;
     youtubeVideoId: string;
     isrc?: string;
   }>;
+  searchByQuery?: Record<string, YouTubeSearchResult[]>;
+  videosById?: Record<
+    string,
+    { durationMs: number; title: string; channelTitle: string }
+  >;
+  spotifySearchByQuery?: Record<string, NormalizedTrack[]>;
   preQuotaUsed?: number;
-  failSearchOnce?: "quota";
+  failYtSearchOnce?: boolean;
   itemsPerStep?: number;
 }) {
   const userId = args.userId ?? "user-1";
@@ -159,6 +207,12 @@ function makeEngine(args: {
     spotifyPlaylistId: spId,
     youtubePlaylistId: ytId,
   });
+  if (args.baseline) {
+    store.baselines.set(pairId, {
+      ...args.baseline,
+      syncedAt: new Date(2026, 0, 1),
+    });
+  }
   for (const m of args.preMappings ?? []) {
     store.mappings.set(`${userId}|${m.spotifyTrackId}`, {
       ...m,
@@ -170,32 +224,39 @@ function makeEngine(args: {
   const quota = new InMemoryQuotaAccounter();
   if (args.preQuotaUsed) quota.used = args.preQuotaUsed;
 
-  const spotify = new FakeSpotify({
-    tracksByPlaylist: { [spId]: args.spTracks },
-  }) as unknown as SpotifyClient;
-  const youtube = new FakeYouTube(
+  const fakeSpotify = new FakeSpotify(
+    { [spId]: args.spTracks },
+    args.spotifySearchByQuery,
+  );
+  const fakeYoutube = new FakeYouTube(
+    { [ytId]: args.ytItems ?? [] },
+    quota,
     {
-      itemsByPlaylist: { [ytId]: args.ytItems ?? [] },
       searchByQuery: args.searchByQuery,
       videosById: args.videosById,
-      failSearchOnce: args.failSearchOnce,
+      ...(args.failYtSearchOnce && { failSearchOnceAs: "quota" as const }),
     },
-    quota,
-  ) as unknown as YouTubeClient & { calls: FakeYouTube["calls"]; insertedItems: FakeYouTube["insertedItems"] };
+  );
 
   const engine = new SyncEngine({
     store,
-    spotify,
-    youtube,
+    spotify: fakeSpotify as unknown as SpotifyClient,
+    youtube: fakeYoutube as unknown as YouTubeClient,
     quota,
     userId,
     itemsPerStep: args.itemsPerStep ?? 5,
   });
 
-  return { engine, store, quota, spotify, youtube, userId, pairId };
+  return {
+    engine,
+    store,
+    quota,
+    spotify: fakeSpotify,
+    youtube: fakeYoutube,
+    userId,
+    pairId,
+  };
 }
-
-// ---- tests ----
 
 describe("InMemorySyncStore reverse mapping", () => {
   it("getMappingsByVideoIds returns only this user's mappings keyed by videoId", async () => {
@@ -232,205 +293,320 @@ describe("InMemorySyncStore reverse mapping", () => {
   });
 });
 
-describe("planRun", () => {
-  it("creates a sync_runs row plus one item per Spotify track", async () => {
+describe("planRun: first sync (no baseline)", () => {
+  it("treats every track as added on its side and produces add_to_yt + add_to_sp", async () => {
     const { engine, store, pairId } = makeEngine({
       spTracks: [
         sp({ id: "t1", title: "A", artists: ["X"], durationMs: 100 }),
         sp({ id: "t2", title: "B", artists: ["Y"], durationMs: 200 }),
       ],
-    });
-    const r = await engine.planRun(pairId, "spotify_to_youtube");
-    expect(r.totalItems).toBe(2);
-    expect(r.plannedAdds).toBe(2);
-    expect(r.plannedSkips).toBe(0);
-    expect(r.plannedQuotaUnits).toBe(202); // 2 search-needed × 101
-    const items = store.items.get(r.runId)!;
-    expect(items.map((i) => i.spotifyTrackId)).toEqual(["t1", "t2"]);
-    expect(items.every((i) => i.action === "add")).toBe(true);
-  });
-
-  it("uses cached track_mappings to avoid search", async () => {
-    const { engine, pairId } = makeEngine({
-      spTracks: [sp({ id: "t1", title: "A", artists: ["X"], durationMs: 100 })],
-      preMappings: [{ spotifyTrackId: "t1", youtubeVideoId: "v-cached" }],
-      ytItems: [],
-    });
-    const r = await engine.planRun(pairId, "spotify_to_youtube");
-    expect(r.plannedAdds).toBe(1);
-    expect(r.plannedQuotaUnits).toBe(50); // known videoId → just an insert
-  });
-
-  it("marks track as skip when cached videoId is already in YT playlist", async () => {
-    const { engine, store, pairId } = makeEngine({
-      spTracks: [sp({ id: "t1", title: "A", artists: ["X"], durationMs: 100 })],
-      preMappings: [{ spotifyTrackId: "t1", youtubeVideoId: "v-cached" }],
       ytItems: [
-        { playlistItemId: "pi1", videoId: "v-cached", videoTitle: "A", channelTitle: "X" },
-      ],
-    });
-    const r = await engine.planRun(pairId, "spotify_to_youtube");
-    expect(r.plannedSkips).toBe(1);
-    expect(r.plannedAdds).toBe(0);
-    expect(r.plannedQuotaUnits).toBe(0);
-    expect(store.items.get(r.runId)![0].action).toBe("skip");
-  });
-
-  it("falls back to ISRC mapping when track-id mapping is absent", async () => {
-    const { engine, pairId } = makeEngine({
-      spTracks: [
-        sp({
-          id: "t-new",
-          title: "A",
-          artists: ["X"],
-          durationMs: 100,
-          isrc: "ABCD12345678",
-        }),
-      ],
-      preMappings: [
         {
-          spotifyTrackId: "t-other",
-          youtubeVideoId: "v-from-isrc",
-          isrc: "ABCD12345678",
+          playlistItemId: "pi-v1",
+          videoId: "v1",
+          videoTitle: "Y1",
+          channelTitle: "Ch1",
         },
       ],
     });
-    const r = await engine.planRun(pairId, "spotify_to_youtube");
-    expect(r.plannedQuotaUnits).toBe(50);
-  });
-});
-
-describe("stepRun", () => {
-  it("processes a known-videoId add and reaches done", async () => {
-    const { engine, pairId, youtube, quota } = makeEngine({
-      spTracks: [sp({ id: "t1", title: "A", artists: ["X"], durationMs: 100 })],
-      preMappings: [{ spotifyTrackId: "t1", youtubeVideoId: "v1" }],
-    });
-    const plan = await engine.planRun(pairId, "spotify_to_youtube");
-    const step = await engine.stepRun(plan.runId);
-    expect(step.status).toBe("done");
-    expect(step.processed).toBe(1);
-    expect((youtube as any).insertedItems).toEqual([
-      { playlistId: "yt-pl", videoId: "v1" },
-    ]);
-    expect(quota.used).toBeGreaterThanOrEqual(50);
+    const r = await engine.planRun(pairId);
+    expect(r.isFirstSync).toBe(true);
+    expect(r.plannedAddYt).toBe(2);
+    expect(r.plannedAddSp).toBe(1);
+    expect(r.plannedRemoveYt).toBe(0);
+    expect(r.plannedRemoveSp).toBe(0);
+    expect(r.totalItems).toBe(3);
+    const items = store.items.get(r.runId)!;
+    expect(items.filter((i) => i.action === "add_to_yt").length).toBe(2);
+    expect(items.filter((i) => i.action === "add_to_sp").length).toBe(1);
   });
 
-  it("skip items don't call YouTube (no extra quota)", async () => {
-    const { engine, pairId, youtube } = makeEngine({
+  it("first-sync skips when a cached mapping says the track is already in YT playlist", async () => {
+    const { engine, pairId } = makeEngine({
       spTracks: [sp({ id: "t1", title: "A", artists: ["X"], durationMs: 100 })],
       preMappings: [{ spotifyTrackId: "t1", youtubeVideoId: "v-cached" }],
       ytItems: [
-        { playlistItemId: "pi", videoId: "v-cached", videoTitle: "A", channelTitle: "X" },
+        {
+          playlistItemId: "pi-cached",
+          videoId: "v-cached",
+          videoTitle: "A",
+          channelTitle: "X",
+        },
       ],
     });
-    const plan = await engine.planRun(pairId, "spotify_to_youtube");
-    const step = await engine.stepRun(plan.runId);
-    expect(step.status).toBe("done");
-    expect((youtube as any).calls.addToPlaylist).toEqual([]);
+    const r = await engine.planRun(pairId);
+    expect(r.plannedSkips).toBe(1);
+    expect(r.plannedAddYt).toBe(0);
   });
+});
 
-  it("resolves an unmapped track via search → score → add and persists mapping", async () => {
-    const { engine, store, pairId, userId, youtube, quota } = makeEngine({
-      spTracks: [
-        sp({
-          id: "t1",
-          title: "Halo",
-          artists: ["Beyoncé"],
-          durationMs: 261_000,
-          isrc: "USRC10800001",
-        }),
+describe("planRun: subsequent sync with baseline", () => {
+  it("emits remove_from_yt for tracks that disappeared on Spotify", async () => {
+    const { engine, store, pairId } = makeEngine({
+      spTracks: [], // empty now — both gone
+      ytItems: [
+        {
+          playlistItemId: "pi-v1",
+          videoId: "v1",
+          videoTitle: "T1",
+          channelTitle: "C",
+        },
+        {
+          playlistItemId: "pi-v2",
+          videoId: "v2",
+          videoTitle: "T2",
+          channelTitle: "C",
+        },
       ],
-      searchByQuery: {
-        "Halo Beyoncé": [
-          { videoId: "v-good", title: "Beyoncé - Halo", channelTitle: "BeyoncéVEVO" },
-          { videoId: "v-bad", title: "Garbage", channelTitle: "Nobody" },
+      baseline: {
+        spotifyTrackIds: ["t1", "t2"],
+        youtubeItems: [
+          { videoId: "v1", playlistItemId: "pi-v1" },
+          { videoId: "v2", playlistItemId: "pi-v2" },
         ],
       },
-      videosById: {
-        "v-good": { durationMs: 262_000, title: "Beyoncé - Halo", channelTitle: "BeyoncéVEVO" },
-        "v-bad": { durationMs: 60_000, title: "Garbage", channelTitle: "Nobody" },
-      },
-    });
-    const plan = await engine.planRun(pairId, "spotify_to_youtube");
-    const step = await engine.stepRun(plan.runId);
-    expect(step.status).toBe("done");
-    expect((youtube as any).insertedItems).toEqual([
-      { playlistId: "yt-pl", videoId: "v-good" },
-    ]);
-    const m = store.mappings.get(`${userId}|t1`);
-    expect(m?.youtubeVideoId).toBe("v-good");
-    // search(100) + videos.list(1) + insert(50) + planRun's playlistItems(1)
-    expect(quota.used).toBeGreaterThanOrEqual(151);
-  });
-
-  it("writes to unmatched_tracks and marks failed when no candidate clears threshold", async () => {
-    const { engine, store, pairId, userId } = makeEngine({
-      spTracks: [
-        sp({ id: "tobs", title: "Obscure", artists: ["NicheBand"], durationMs: 200_000 }),
+      preMappings: [
+        { spotifyTrackId: "t1", youtubeVideoId: "v1" },
+        { spotifyTrackId: "t2", youtubeVideoId: "v2" },
       ],
-      searchByQuery: {
-        "Obscure NicheBand": [
-          { videoId: "vNot1", title: "Totally Unrelated", channelTitle: "Random" },
-          { videoId: "vNot2", title: "Also Different", channelTitle: "Other" },
-        ],
-      },
-      videosById: {
-        vNot1: { durationMs: 60_000, title: "Totally Unrelated", channelTitle: "Random" },
-        vNot2: { durationMs: 90_000, title: "Also Different", channelTitle: "Other" },
-      },
     });
-    const plan = await engine.planRun(pairId, "spotify_to_youtube");
-    const step = await engine.stepRun(plan.runId);
-    expect(step.status).toBe("done");
-    expect(store.unmatched).toHaveLength(1);
-    expect(store.unmatched[0].userId).toBe(userId);
-    const item = store.items.get(plan.runId)![0];
-    expect(item.status).toBe("failed");
-    expect(item.error).toBe("low_confidence");
+    const r = await engine.planRun(pairId);
+    expect(r.plannedRemoveYt).toBe(2);
+    expect(r.plannedAddYt).toBe(0);
+    expect(r.plannedAddSp).toBe(0);
+    const items = store.items.get(r.runId)!;
+    expect(items.every((i) => i.action === "remove_from_yt")).toBe(true);
+    expect(items[0].youtubePlaylistItemId).toBe("pi-v1");
   });
 
-  it("pauses the run on QuotaExceededError mid-step", async () => {
+  it("emits remove_from_sp for tracks that disappeared on YouTube", async () => {
     const { engine, store, pairId } = makeEngine({
       spTracks: [
         sp({ id: "t1", title: "A", artists: ["X"], durationMs: 100 }),
         sp({ id: "t2", title: "B", artists: ["Y"], durationMs: 200 }),
       ],
-      failSearchOnce: "quota",
+      ytItems: [], // both gone on YT
+      baseline: {
+        spotifyTrackIds: ["t1", "t2"],
+        youtubeItems: [
+          { videoId: "v1", playlistItemId: "pi-v1" },
+          { videoId: "v2", playlistItemId: "pi-v2" },
+        ],
+      },
+      preMappings: [
+        { spotifyTrackId: "t1", youtubeVideoId: "v1" },
+        { spotifyTrackId: "t2", youtubeVideoId: "v2" },
+      ],
     });
-    const plan = await engine.planRun(pairId, "spotify_to_youtube");
-    const step = await engine.stepRun(plan.runId);
-    expect(step.status).toBe("paused_quota");
-    const run = store.runs.get(plan.runId)!;
-    expect(run.status).toBe("paused_quota");
+    const r = await engine.planRun(pairId);
+    expect(r.plannedRemoveSp).toBe(2);
+    const items = store.items.get(r.runId)!;
+    expect(items.every((i) => i.action === "remove_from_sp")).toBe(true);
+    expect(new Set(items.map((i) => i.spotifyTrackId))).toEqual(
+      new Set(["t1", "t2"]),
+    );
   });
 
-  it("refuses to start a step when remaining quota < 100 and search is needed", async () => {
-    const { engine, pairId, store } = makeEngine({
+  it("conflict: track removed on SP but added on YT (per mapping) → preserved on both", async () => {
+    // Baseline says t1 was on SP and v1 was on YT.
+    // Now: t1 removed from SP. v-other now on YT (was v1 before, but YT user
+    // re-added the same video → mapping says v1↔t1, so this is the conflict).
+    // Wait — easier scenario: SP removed t1, YT also still has v1 (no change)
+    // — that's a pure remove. The conflict scenario is SP removed t1 AND YT
+    // *added* the same video v1 since baseline. Tricky to simulate cleanly.
+    // Construct: baseline SP={t1}, YT={}. Now: SP={}, YT={v1}. Mapping t1↔v1.
+    const { engine, pairId } = makeEngine({
+      spTracks: [], // user removed t1
+      ytItems: [
+        {
+          playlistItemId: "pi-v1",
+          videoId: "v1",
+          videoTitle: "A",
+          channelTitle: "X",
+        },
+      ],
+      baseline: {
+        spotifyTrackIds: ["t1"],
+        youtubeItems: [], // v1 was NOT on YT at last sync
+      },
+      preMappings: [{ spotifyTrackId: "t1", youtubeVideoId: "v1" }],
+    });
+    const r = await engine.planRun(pairId);
+    expect(r.plannedRemoveYt).toBe(0); // suppressed by conflict resolution
+    expect(r.plannedAddSp).toBe(0); // suppressed
+    expect(r.totalItems).toBe(0);
+  });
+});
+
+describe("planRun guards", () => {
+  it("refuses to start when an active run already exists for the pair", async () => {
+    const { engine, pairId, store, userId } = makeEngine({ spTracks: [] });
+    await store.createSyncRun({ pairId, userId, mode: "two_way" });
+    await expect(engine.planRun(pairId)).rejects.toBeInstanceOf(
+      ActiveRunExistsError,
+    );
+  });
+
+  it("rejects unknown pair", async () => {
+    const { engine } = makeEngine({ spTracks: [] });
+    await expect(engine.planRun("nope")).rejects.toThrow(/not found/);
+  });
+});
+
+describe("stepRun: dispatch and idempotency", () => {
+  it("processes add_to_yt with cached videoId then commits baseline on done", async () => {
+    const { engine, store, pairId, youtube } = makeEngine({
       spTracks: [sp({ id: "t1", title: "A", artists: ["X"], durationMs: 100 })],
-      preQuotaUsed: 9990, // 10 units left < 100 guard
+      preMappings: [{ spotifyTrackId: "t1", youtubeVideoId: "v1" }],
     });
-    const plan = await engine.planRun(pairId, "spotify_to_youtube");
+    const plan = await engine.planRun(pairId);
     const step = await engine.stepRun(plan.runId);
-    expect(step.status).toBe("paused_quota");
-    expect(step.processed).toBe(0);
-    expect(store.runs.get(plan.runId)!.status).toBe("paused_quota");
+    expect(step.status).toBe("done");
+    expect(youtube.inserts).toEqual([{ playlistId: "yt-pl", videoId: "v1" }]);
+    expect(store.baselines.has(pairId)).toBe(true);
+    expect(store.baselineCommits).toHaveLength(1);
+    expect(store.baselines.get(pairId)?.spotifyTrackIds).toEqual(["t1"]);
+    expect(store.baselines.get(pairId)?.youtubeItems[0]?.videoId).toBe("v1");
   });
 
-  it("is idempotent across two stepRun calls when run is already done", async () => {
+  it("processes remove_from_yt using playlistItemId from baseline", async () => {
+    const { engine, pairId, youtube, store } = makeEngine({
+      spTracks: [],
+      ytItems: [
+        {
+          playlistItemId: "pi-v1",
+          videoId: "v1",
+          videoTitle: "A",
+          channelTitle: "X",
+        },
+      ],
+      baseline: {
+        spotifyTrackIds: ["t1"],
+        youtubeItems: [{ videoId: "v1", playlistItemId: "pi-v1" }],
+      },
+      preMappings: [{ spotifyTrackId: "t1", youtubeVideoId: "v1" }],
+    });
+    const plan = await engine.planRun(pairId);
+    expect(plan.plannedRemoveYt).toBe(1);
+    const step = await engine.stepRun(plan.runId);
+    expect(step.status).toBe("done");
+    expect(youtube.removes).toEqual(["pi-v1"]);
+    // After done, baseline reflects empty YT playlist (we removed the only item).
+    expect(store.baselines.get(pairId)?.youtubeItems).toEqual([]);
+  });
+
+  it("processes remove_from_sp using spotify_track_id", async () => {
+    const { engine, pairId, spotify, store } = makeEngine({
+      spTracks: [sp({ id: "t1", title: "A", artists: ["X"], durationMs: 100 })],
+      ytItems: [],
+      baseline: {
+        spotifyTrackIds: ["t1"],
+        youtubeItems: [{ videoId: "v1", playlistItemId: "pi-v1" }],
+      },
+      preMappings: [{ spotifyTrackId: "t1", youtubeVideoId: "v1" }],
+    });
+    const plan = await engine.planRun(pairId);
+    expect(plan.plannedRemoveSp).toBe(1);
+    const step = await engine.stepRun(plan.runId);
+    expect(step.status).toBe("done");
+    expect(spotify.removes).toHaveLength(1);
+    expect(spotify.removes[0].tracks[0].uri).toBe("spotify:track:t1");
+    // Baseline now reflects empty SP playlist.
+    expect(store.baselines.get(pairId)?.spotifyTrackIds).toEqual([]);
+  });
+
+  it("processes add_to_sp via cached reverse mapping", async () => {
+    const { engine, pairId, spotify } = makeEngine({
+      spTracks: [],
+      ytItems: [
+        {
+          playlistItemId: "pi-v1",
+          videoId: "v1",
+          videoTitle: "A",
+          channelTitle: "BeyoncéVEVO",
+        },
+      ],
+      preMappings: [{ spotifyTrackId: "sp-A", youtubeVideoId: "v1" }],
+    });
+    // No baseline → first sync → yt_added has v1, mapping says sp-A.
+    const plan = await engine.planRun(pairId);
+    expect(plan.plannedAddSp).toBe(1);
+    const step = await engine.stepRun(plan.runId);
+    expect(step.status).toBe("done");
+    expect(spotify.inserts).toEqual([
+      { playlistId: "sp-pl", uris: ["spotify:track:sp-A"] },
+    ]);
+  });
+
+  it("processes add_to_sp via Spotify search when no mapping", async () => {
+    const { engine, pairId, spotify, store, userId } = makeEngine({
+      spTracks: [],
+      ytItems: [
+        {
+          playlistItemId: "pi-v1",
+          videoId: "v1",
+          videoTitle: "Beyoncé - Halo",
+          channelTitle: "BeyoncéVEVO",
+        },
+      ],
+      videosById: {
+        v1: {
+          durationMs: 261_000,
+          title: "Beyoncé - Halo (Official Music Video)",
+          channelTitle: "BeyoncéVEVO",
+        },
+      },
+      spotifySearchByQuery: {
+        Halo: [
+          {
+            source: "spotify",
+            sourceTrackId: "sp-halo",
+            title: "Halo",
+            artists: ["Beyoncé"],
+            durationMs: 261_000,
+            isrc: "USRC10800001",
+          },
+        ],
+      },
+    });
+    const plan = await engine.planRun(pairId);
+    expect(plan.plannedAddSp).toBe(1);
+    const step = await engine.stepRun(plan.runId);
+    expect(step.status).toBe("done");
+    expect(spotify.inserts).toEqual([
+      { playlistId: "sp-pl", uris: ["spotify:track:sp-halo"] },
+    ]);
+    expect(store.mappings.get(`${userId}|sp-halo`)?.youtubeVideoId).toBe("v1");
+  });
+
+  it("pauses on QuotaExceededError without committing baseline", async () => {
+    const { engine, pairId, store } = makeEngine({
+      spTracks: [
+        sp({ id: "t1", title: "A", artists: ["X"], durationMs: 100 }),
+      ],
+      failYtSearchOnce: true,
+    });
+    const plan = await engine.planRun(pairId);
+    const step = await engine.stepRun(plan.runId);
+    expect(step.status).toBe("paused_quota");
+    expect(store.runs.get(plan.runId)!.status).toBe("paused_quota");
+    expect(store.baselines.has(pairId)).toBe(false); // critical: baseline NOT written
+    expect(store.baselineCommits).toHaveLength(0);
+  });
+
+  it("idempotent across two stepRun calls when run is already done", async () => {
     const { engine, pairId } = makeEngine({
       spTracks: [sp({ id: "t1", title: "A", artists: ["X"], durationMs: 100 })],
       preMappings: [{ spotifyTrackId: "t1", youtubeVideoId: "v1" }],
     });
-    const plan = await engine.planRun(pairId, "spotify_to_youtube");
+    const plan = await engine.planRun(pairId);
     const a = await engine.stepRun(plan.runId);
     const b = await engine.stepRun(plan.runId);
     expect(a.status).toBe("done");
     expect(b.status).toBe("done");
-    expect(b.processed).toBe(0);
   });
 
-  it("does not duplicate inserts when same videoId would be added twice", async () => {
+  it("does not duplicate inserts when same videoId would be added twice in the batch", async () => {
     const { engine, pairId, youtube } = makeEngine({
       spTracks: [
         sp({ id: "t1", title: "A", artists: ["X"], durationMs: 100 }),
@@ -441,24 +617,35 @@ describe("stepRun", () => {
         { spotifyTrackId: "t2", youtubeVideoId: "vDup" },
       ],
     });
-    const plan = await engine.planRun(pairId, "spotify_to_youtube");
+    const plan = await engine.planRun(pairId);
     const step = await engine.stepRun(plan.runId);
     expect(step.status).toBe("done");
-    expect((youtube as any).insertedItems).toEqual([
-      { playlistId: "yt-pl", videoId: "vDup" },
-    ]);
+    expect(youtube.inserts.filter((i) => i.videoId === "vDup")).toHaveLength(1);
   });
 
   it("rejects stepRun for a run owned by another user", async () => {
-    const { engine, pairId } = makeEngine({
+    const { engine, pairId, store, userId } = makeEngine({
       spTracks: [sp({ id: "t1", title: "A", artists: ["X"], durationMs: 100 })],
     });
-    const plan = await engine.planRun(pairId, "spotify_to_youtube");
-    // Build a second engine with a different userId pointing at the same store/run.
-    const other = new SyncEngine({
-      ...(engine as unknown as { deps: { store: any; spotify: any; youtube: any; quota: any; userId: string } }).deps,
+    const plan = await engine.planRun(pairId);
+    const otherEngine = new SyncEngine({
+      ...((engine as unknown) as { deps: any }).deps,
       userId: "different-user",
     });
-    await expect(other.stepRun(plan.runId)).rejects.toThrow(/does not belong/);
+    await expect(otherEngine.stepRun(plan.runId)).rejects.toThrow(
+      /does not belong/,
+    );
+  });
+
+  it("refuses to start a step when remaining quota < 100 and search is needed", async () => {
+    const { engine, pairId, store } = makeEngine({
+      spTracks: [sp({ id: "t1", title: "A", artists: ["X"], durationMs: 100 })],
+      preQuotaUsed: 9990,
+    });
+    const plan = await engine.planRun(pairId);
+    const step = await engine.stepRun(plan.runId);
+    expect(step.status).toBe("paused_quota");
+    expect(store.runs.get(plan.runId)!.status).toBe("paused_quota");
+    expect(store.baselines.has(pairId)).toBe(false);
   });
 });

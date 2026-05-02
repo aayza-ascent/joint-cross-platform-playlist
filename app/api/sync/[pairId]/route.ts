@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { withSession } from "@/lib/auth/session";
 import { spotifyForUser, youtubeForUser } from "@/lib/clients";
-import { SyncEngine } from "@/lib/sync/engine";
+import { ActiveRunExistsError, SyncEngine } from "@/lib/sync/engine";
 import { DrizzleSyncStore } from "@/lib/sync/store";
 import { NotConnectedError } from "@/lib/auth/tokens";
 
@@ -20,12 +20,18 @@ export async function POST(
         quota: yt.quota,
         userId,
       });
-      const result = await engine.planRun(pairId, "spotify_to_youtube");
+      const result = await engine.planRun(pairId);
       return NextResponse.json(result);
     } catch (err) {
       if (err instanceof NotConnectedError) {
         return NextResponse.json(
           { error: "not_connected", provider: err.provider },
+          { status: 409 },
+        );
+      }
+      if (err instanceof ActiveRunExistsError) {
+        return NextResponse.json(
+          { error: "active_run_exists" },
           { status: 409 },
         );
       }

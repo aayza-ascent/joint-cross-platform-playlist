@@ -180,16 +180,26 @@ export const syncRuns = pgTable("sync_runs", {
 export const syncRunItems = pgTable(
   "sync_run_items",
   {
+    id: text("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
     runId: text("run_id")
       .notNull()
       .references(() => syncRuns.id, { onDelete: "cascade" }),
-    spotifyTrackId: text("spotify_track_id").notNull(),
+    // Either spotifyTrackId or youtubeVideoId is present at plan time,
+    // depending on which side originated the op. Both can be present
+    // once the op is resolved (search succeeded or mapping was hit).
+    spotifyTrackId: text("spotify_track_id"),
+    youtubeVideoId: text("youtube_video_id"),
+    // Required for remove_from_yt; YouTube removes by playlistItem.id, not videoId.
+    youtubePlaylistItemId: text("youtube_playlist_item_id"),
     action: text("action").notNull(),
     status: text("status").notNull(),
-    youtubeVideoId: text("youtube_video_id"),
     error: text("error"),
   },
-  (t) => [primaryKey({ columns: [t.runId, t.spotifyTrackId] })],
+  (t) => [
+    index("sync_run_items_run_status_idx").on(t.runId, t.status),
+  ],
 );
 
 export const unmatchedTracks = pgTable(

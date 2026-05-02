@@ -15,6 +15,13 @@
       "when": 1777680003486,
       "tag": "0001_two_way_baseline",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1777680482354,
+      "tag": "0002_two_way_sync_run_items",
+      "breakpoints": true
     }
   ]
 }

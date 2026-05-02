@@ -15,9 +15,19 @@ export type SyncRunStatus =
   | "failed"
   | "paused_quota";
 
-export type SyncMode = "spotify_to_youtube";
+export type SyncMode = "spotify_to_youtube" | "two_way";
 
-export type SyncItemAction = "add" | "remove" | "skip";
+// Action vocabulary for two-way: each item names exactly one operation on one
+// provider. Legacy 'add' / 'remove' are kept as readable values so older rows
+// in the DB don't trip type guards if anyone reads history.
+export type SyncItemAction =
+  | "add_to_yt"
+  | "add_to_sp"
+  | "remove_from_yt"
+  | "remove_from_sp"
+  | "skip"
+  | "add"
+  | "remove";
 export type SyncItemStatus = "pending" | "done" | "failed";
 
 export type PairRef = {
@@ -25,6 +35,14 @@ export type PairRef = {
   userId: string;
   spotifyPlaylistId: string;
   youtubePlaylistId: string;
+};
+
+export type YoutubeBaselineItem = { videoId: string; playlistItemId: string };
+
+export type PairBaseline = {
+  spotifyTrackIds: string[];
+  youtubeItems: YoutubeBaselineItem[];
+  syncedAt: Date;
 };
 
 export type Mapping = {
@@ -47,16 +65,31 @@ export type SyncRunRow = {
 };
 
 export type SyncItemRow = {
+  id: string;
   runId: string;
-  spotifyTrackId: string;
   action: SyncItemAction;
   status: SyncItemStatus;
+  spotifyTrackId: string | null;
   youtubeVideoId: string | null;
+  youtubePlaylistItemId: string | null;
   error: string | null;
 };
 
+export type NewSyncItem = Omit<SyncItemRow, "id" | "status" | "error">;
+
 export interface SyncStore {
   getPair(pairId: string, userId: string): Promise<PairRef | null>;
+
+  // Returns null when the pair has never had a successful sync.
+  getPairBaseline(
+    pairId: string,
+    userId: string,
+  ): Promise<PairBaseline | null>;
+
+  // Are there any non-terminal runs for this pair? Two-way refuses to start
+  // a new run if one is already in flight; otherwise the second planRun would
+  // see a baseline that doesn't reflect the in-flight run's effects.
+  hasActiveRun(pairId: string, userId: string): Promise<boolean>;
 
   getMappingsByTrackIds(
     userId: string,
@@ -68,10 +101,7 @@ export interface SyncStore {
     isrcs: string[],
   ): Promise<Map<string, Mapping>>;
 
-  // Reverse lookup: given a list of YouTube videoIds, return any mappings
-  // that point to them. Keyed by videoId. Used by the two-way add_to_sp
-  // path to short-circuit Spotify search when we've matched this video
-  // before.
+  // Reverse lookup keyed by youtube_video_id.
   getMappingsByVideoIds(
     userId: string,
     videoIds: string[],
@@ -83,18 +113,24 @@ export interface SyncStore {
     mode: SyncMode;
   }): Promise<string>;
 
-  insertSyncRunItems(
-    items: Array<Omit<SyncItemRow, "status" | "error">>,
-  ): Promise<void>;
+  insertSyncRunItems(items: NewSyncItem[]): Promise<void>;
 
   getSyncRun(runId: string): Promise<SyncRunRow | null>;
 
   getPendingItems(runId: string, limit: number): Promise<SyncItemRow[]>;
 
   updateSyncRunItem(
-    runId: string,
-    trackId: string,
-    patch: Partial<Pick<SyncItemRow, "status" | "youtubeVideoId" | "error">>,
+    itemId: string,
+    patch: Partial<
+      Pick<
+        SyncItemRow,
+        | "status"
+        | "spotifyTrackId"
+        | "youtubeVideoId"
+        | "youtubePlaylistItemId"
+        | "error"
+      >
+    >,
   ): Promise<void>;
 
   updateSyncRun(
@@ -105,9 +141,17 @@ export interface SyncStore {
       removedDelta?: number;
       failedDelta?: number;
       quotaDelta?: number;
-      finished?: boolean;
       error?: string | null;
     },
+  ): Promise<void>;
+
+  // Commits status='done', finishedAt, AND writes the new baseline atomically.
+  // Critical: paused_quota and failed runs MUST NOT call this — the baseline
+  // staying put is what makes a re-run resume from the same reference point.
+  commitRunDoneAndBaseline(
+    runId: string,
+    pairId: string,
+    baseline: PairBaseline,
   ): Promise<void>;
 
   upsertMapping(args: {
@@ -143,6 +187,36 @@ export class DrizzleSyncStore implements SyncStore {
       spotifyPlaylistId: row.spotifyPlaylistId,
       youtubePlaylistId: row.youtubePlaylistId,
     };
+  }
+
+  async getPairBaseline(
+    pairId: string,
+    userId: string,
+  ): Promise<PairBaseline | null> {
+    const row = await this.db.query.playlistPairs.findFirst({
+      where: and(eq(playlistPairs.id, pairId), eq(playlistPairs.userId, userId)),
+    });
+    if (!row || !row.lastSyncedAt) return null;
+    return {
+      spotifyTrackIds: row.lastKnownSpotifyTrackIds ?? [],
+      youtubeItems: row.lastKnownYoutubeItems ?? [],
+      syncedAt: row.lastSyncedAt,
+    };
+  }
+
+  async hasActiveRun(pairId: string, userId: string): Promise<boolean> {
+    const row = await this.db
+      .select({ id: syncRuns.id })
+      .from(syncRuns)
+      .where(
+        and(
+          eq(syncRuns.pairId, pairId),
+          eq(syncRuns.userId, userId),
+          inArray(syncRuns.status, ["pending", "running", "paused_quota"]),
+        ),
+      )
+      .limit(1);
+    return row.length > 0;
   }
 
   async getMappingsByTrackIds(
@@ -241,17 +315,16 @@ export class DrizzleSyncStore implements SyncStore {
     return row.id;
   }
 
-  async insertSyncRunItems(
-    items: Array<Omit<SyncItemRow, "status" | "error">>,
-  ): Promise<void> {
+  async insertSyncRunItems(items: NewSyncItem[]): Promise<void> {
     if (items.length === 0) return;
     await this.db.insert(syncRunItems).values(
       items.map((it) => ({
         runId: it.runId,
-        spotifyTrackId: it.spotifyTrackId,
         action: it.action,
         status: "pending" as SyncItemStatus,
+        spotifyTrackId: it.spotifyTrackId,
         youtubeVideoId: it.youtubeVideoId,
+        youtubePlaylistItemId: it.youtubePlaylistItemId,
       })),
     );
   }
@@ -285,29 +358,34 @@ export class DrizzleSyncStore implements SyncStore {
       .where(and(eq(syncRunItems.runId, runId), eq(syncRunItems.status, "pending")))
       .limit(limit);
     return rows.map((r) => ({
+      id: r.id,
       runId: r.runId,
-      spotifyTrackId: r.spotifyTrackId,
       action: r.action as SyncItemAction,
       status: r.status as SyncItemStatus,
+      spotifyTrackId: r.spotifyTrackId,
       youtubeVideoId: r.youtubeVideoId,
+      youtubePlaylistItemId: r.youtubePlaylistItemId,
       error: r.error,
     }));
   }
 
   async updateSyncRunItem(
-    runId: string,
-    trackId: string,
-    patch: Partial<Pick<SyncItemRow, "status" | "youtubeVideoId" | "error">>,
+    itemId: string,
+    patch: Partial<
+      Pick<
+        SyncItemRow,
+        | "status"
+        | "spotifyTrackId"
+        | "youtubeVideoId"
+        | "youtubePlaylistItemId"
+        | "error"
+      >
+    >,
   ): Promise<void> {
     await this.db
       .update(syncRunItems)
       .set(patch)
-      .where(
-        and(
-          eq(syncRunItems.runId, runId),
-          eq(syncRunItems.spotifyTrackId, trackId),
-        ),
-      );
+      .where(eq(syncRunItems.id, itemId));
   }
 
   async updateSyncRun(
@@ -318,7 +396,6 @@ export class DrizzleSyncStore implements SyncStore {
       removedDelta?: number;
       failedDelta?: number;
       quotaDelta?: number;
-      finished?: boolean;
       error?: string | null;
     },
   ): Promise<void> {
@@ -334,10 +411,36 @@ export class DrizzleSyncStore implements SyncStore {
         removedCount: cur.removedCount + (patch.removedDelta ?? 0),
         failedCount: cur.failedCount + (patch.failedDelta ?? 0),
         quotaUnitsSpent: cur.quotaUnitsSpent + (patch.quotaDelta ?? 0),
-        ...(patch.finished && { finishedAt: new Date() }),
         ...(patch.error !== undefined && { error: patch.error }),
       })
       .where(eq(syncRuns.id, runId));
+  }
+
+  async commitRunDoneAndBaseline(
+    runId: string,
+    pairId: string,
+    baseline: PairBaseline,
+  ): Promise<void> {
+    // Neon HTTP doesn't support transactions over a single round-trip, so we
+    // rely on conditional updates instead. The two writes happen back-to-back;
+    // the run-status update is the visible 'commit point' for callers polling
+    // /runs. If the baseline write fails after the run flips to done, the next
+    // sync will treat the playlist as if it had no baseline (worst case: a
+    // duplicate union sync). That's a less bad failure mode than the inverse:
+    // baseline written but run still 'running' would mark recovered tracks as
+    // already-baseline-known.
+    await this.db
+      .update(syncRuns)
+      .set({ status: "done", finishedAt: new Date() })
+      .where(eq(syncRuns.id, runId));
+    await this.db
+      .update(playlistPairs)
+      .set({
+        lastSyncedAt: baseline.syncedAt,
+        lastKnownSpotifyTrackIds: baseline.spotifyTrackIds,
+        lastKnownYoutubeItems: baseline.youtubeItems,
+      })
+      .where(eq(playlistPairs.id, pairId));
   }
 
   async upsertMapping(args: {
@@ -398,6 +501,7 @@ export class DrizzleSyncStore implements SyncStore {
 
 export class InMemorySyncStore implements SyncStore {
   pairs = new Map<string, PairRef>();
+  baselines = new Map<string, PairBaseline>();
   mappings = new Map<string, Mapping & { userId: string }>();
   unmatched: Array<{
     userId: string;
@@ -407,6 +511,7 @@ export class InMemorySyncStore implements SyncStore {
   }> = [];
   runs = new Map<string, SyncRunRow>();
   items = new Map<string, SyncItemRow[]>();
+  baselineCommits: Array<{ runId: string; pairId: string; baseline: PairBaseline }> = [];
   private seq = 0;
 
   private mappingKey(userId: string, trackId: string) {
@@ -417,6 +522,27 @@ export class InMemorySyncStore implements SyncStore {
     const p = this.pairs.get(pairId);
     if (!p || p.userId !== userId) return null;
     return p;
+  }
+
+  async getPairBaseline(pairId: string, userId: string) {
+    const p = this.pairs.get(pairId);
+    if (!p || p.userId !== userId) return null;
+    return this.baselines.get(pairId) ?? null;
+  }
+
+  async hasActiveRun(pairId: string, userId: string) {
+    for (const r of this.runs.values()) {
+      if (
+        r.pairId === pairId &&
+        r.userId === userId &&
+        (r.status === "pending" ||
+          r.status === "running" ||
+          r.status === "paused_quota")
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   async getMappingsByTrackIds(userId: string, trackIds: string[]) {
@@ -474,13 +600,16 @@ export class InMemorySyncStore implements SyncStore {
     return id;
   }
 
-  async insertSyncRunItems(
-    rows: Array<Omit<SyncItemRow, "status" | "error">>,
-  ) {
+  async insertSyncRunItems(rows: NewSyncItem[]) {
     for (const r of rows) {
       const arr = this.items.get(r.runId);
       if (!arr) throw new Error("unknown runId");
-      arr.push({ ...r, status: "pending", error: null });
+      arr.push({
+        ...r,
+        id: `item_${++this.seq}`,
+        status: "pending",
+        error: null,
+      });
     }
   }
 
@@ -495,13 +624,25 @@ export class InMemorySyncStore implements SyncStore {
   }
 
   async updateSyncRunItem(
-    runId: string,
-    trackId: string,
-    patch: Partial<Pick<SyncItemRow, "status" | "youtubeVideoId" | "error">>,
+    itemId: string,
+    patch: Partial<
+      Pick<
+        SyncItemRow,
+        | "status"
+        | "spotifyTrackId"
+        | "youtubeVideoId"
+        | "youtubePlaylistItemId"
+        | "error"
+      >
+    >,
   ) {
-    const arr = this.items.get(runId) ?? [];
-    const idx = arr.findIndex((it) => it.spotifyTrackId === trackId);
-    if (idx >= 0) arr[idx] = { ...arr[idx], ...patch };
+    for (const arr of this.items.values()) {
+      const idx = arr.findIndex((it) => it.id === itemId);
+      if (idx >= 0) {
+        arr[idx] = { ...arr[idx], ...patch };
+        return;
+      }
+    }
   }
 
   async updateSyncRun(
@@ -512,7 +653,6 @@ export class InMemorySyncStore implements SyncStore {
       removedDelta?: number;
       failedDelta?: number;
       quotaDelta?: number;
-      finished?: boolean;
       error?: string | null;
     },
   ) {
@@ -524,6 +664,17 @@ export class InMemorySyncStore implements SyncStore {
     r.failedCount += patch.failedDelta ?? 0;
     r.quotaUnitsSpent += patch.quotaDelta ?? 0;
     if (patch.error !== undefined) r.error = patch.error;
+  }
+
+  async commitRunDoneAndBaseline(
+    runId: string,
+    pairId: string,
+    baseline: PairBaseline,
+  ) {
+    const r = this.runs.get(runId);
+    if (r) r.status = "done";
+    this.baselines.set(pairId, baseline);
+    this.baselineCommits.push({ runId, pairId, baseline });
   }
 
   async upsertMapping(args: {
