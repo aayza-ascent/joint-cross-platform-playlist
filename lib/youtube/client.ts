@@ -67,9 +67,10 @@ export class YouTubeClient {
       });
       const json: PagedPlaylists = await this.request("GET", url, undefined, 1);
       for (const p of json.items) {
+        if (!p?.id) continue;
         out.push({
           id: p.id,
-          title: p.snippet.title,
+          title: p.snippet?.title ?? "(untitled)",
           itemCount: p.contentDetails?.itemCount ?? 0,
         });
       }
@@ -305,10 +306,10 @@ export function parseIso8601Duration(d: string): number {
 type PagedPlaylists = {
   nextPageToken?: string;
   items: Array<{
-    id: string;
-    snippet: { title: string };
-    contentDetails?: { itemCount: number };
-  }>;
+    id?: string;
+    snippet?: { title?: string };
+    contentDetails?: { itemCount?: number };
+  } | null>;
 };
 
 type PagedPlaylistItems = {

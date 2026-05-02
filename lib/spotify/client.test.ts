@@ -60,6 +60,35 @@ describe("SpotifyClient", () => {
     expect(fn).toHaveBeenCalledTimes(2);
   });
 
+  it("getPlaylists tolerates missing/null fields on curated playlists", async () => {
+    // Spotify returns malformed entries for some algorithmic playlists
+    // (Daily Mix, Discover Weekly): tracks/name can be absent or null.
+    const { fn } = mockFetch([
+      {
+        status: 200,
+        body: {
+          next: null,
+          items: [
+            { id: "p1", name: "Real", tracks: { total: 12 } },
+            { id: "p-no-tracks", name: "Curated" }, // no tracks field
+            { id: "p-null-tracks", name: "Other", tracks: null },
+            null, // entire item null
+            { id: "p-no-name" }, // missing name
+            {}, // missing id — must be skipped, not crash
+          ],
+        },
+      },
+    ]);
+    const c = new SpotifyClient(tokenProvider, fn);
+    const playlists = await c.getPlaylists();
+    expect(playlists).toEqual([
+      { id: "p1", name: "Real", trackCount: 12 },
+      { id: "p-no-tracks", name: "Curated", trackCount: 0 },
+      { id: "p-null-tracks", name: "Other", trackCount: 0 },
+      { id: "p-no-name", name: "(untitled)", trackCount: 0 },
+    ]);
+  });
+
   it("normalizes playlist tracks and skips local/non-track items", async () => {
     const { fn } = mockFetch([
       {

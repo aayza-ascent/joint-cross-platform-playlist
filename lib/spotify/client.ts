@@ -27,7 +27,15 @@ export class SpotifyClient {
     while (url) {
       const json: PagedPlaylists = await this.request("GET", url);
       for (const p of json.items) {
-        out.push({ id: p.id, name: p.name, trackCount: p.tracks.total });
+        // Spotify's /me/playlists occasionally returns entries with missing
+        // fields for algorithmic/curated playlists (Daily Mix, etc). Skip
+        // anything without an id and tolerate missing tracks/total.
+        if (!p?.id) continue;
+        out.push({
+          id: p.id,
+          name: p.name ?? "(untitled)",
+          trackCount: p.tracks?.total ?? 0,
+        });
       }
       url = json.next ?? null;
     }
@@ -176,10 +184,10 @@ async function safeText(res: Response): Promise<string> {
 type PagedPlaylists = {
   next: string | null;
   items: Array<{
-    id: string;
-    name: string;
-    tracks: { total: number };
-  }>;
+    id?: string;
+    name?: string;
+    tracks?: { total?: number };
+  } | null>;
 };
 
 type PagedPlaylistTracks = {
