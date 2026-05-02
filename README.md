@@ -110,19 +110,21 @@ npm run db:studio    # browse data
 
 ## Deploy to Vercel
 
+Production URL: **https://joint-cross-platform-playlist.vercel.app**
+
 Once the app works locally:
 
 1. **Vercel** → New Project → import this GitHub repo.
-2. **Environment Variables**: copy every value from `.env.local` *except*:
-   - `NEXTAUTH_URL` and `NEXT_PUBLIC_APP_URL` should be the production URL
-     (e.g. `https://your-project.vercel.app`).
-   - The Spotify redirect URI and Google redirect URIs need the production URL
-     too — see step 3 below.
+2. **Environment Variables** (Production environment): copy every value from
+   `.env.local` *except* the URL ones, which become:
+   - `NEXTAUTH_URL=https://joint-cross-platform-playlist.vercel.app`
+   - `NEXT_PUBLIC_APP_URL=https://joint-cross-platform-playlist.vercel.app`
 3. **Add production redirect URIs to your OAuth clients** before deploying:
-   - Google client → add `https://your-project.vercel.app/api/auth/callback/google`
-     and `https://your-project.vercel.app/api/connect/youtube/callback`.
-   - Spotify app → add
-     `https://your-project.vercel.app/api/connect/spotify/callback`.
+   - Google OAuth client → Authorized redirect URIs, add:
+     - `https://joint-cross-platform-playlist.vercel.app/api/auth/callback/google`
+     - `https://joint-cross-platform-playlist.vercel.app/api/connect/youtube/callback`
+   - Spotify app → Redirect URIs, add:
+     - `https://joint-cross-platform-playlist.vercel.app/api/connect/spotify/callback`
 4. Push to `main` (or click *Deploy* in Vercel) — Vercel builds and deploys.
 5. After first deploy, sign in and run a small sync to verify.
 
