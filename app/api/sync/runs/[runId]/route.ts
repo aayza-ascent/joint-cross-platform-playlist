@@ -37,11 +37,15 @@ export async function GET(
       removedSp: 0,
       skipped: 0,
     };
+    const failures: Array<{ action: string; error: string | null }> = [];
     for (const it of items) {
       c.total++;
       if (it.status === "pending") c.pending++;
       if (it.status === "done") c.done++;
-      if (it.status === "failed") c.failed++;
+      if (it.status === "failed") {
+        c.failed++;
+        failures.push({ action: it.action, error: it.error });
+      }
       if (it.status === "done") {
         if (it.action === "add_to_yt" || it.action === "add") c.addedYt++;
         else if (it.action === "add_to_sp") c.addedSp++;
@@ -51,6 +55,6 @@ export async function GET(
         else if (it.action === "skip") c.skipped++;
       }
     }
-    return NextResponse.json({ run, counts: c });
+    return NextResponse.json({ run, counts: c, failures });
   });
 }

@@ -28,6 +28,7 @@ type SyncProgress = {
   isFirstSync: boolean;
   quotaRemainingToday: number;
   errorDetail?: string;
+  failures?: Array<{ action: string; error: string | null }>;
 };
 
 export default function DashboardClient(props: {
@@ -234,6 +235,7 @@ export default function DashboardClient(props: {
           removedSp: number;
           failed: number;
         };
+        failures?: Array<{ action: string; error: string | null }>;
       }>(runRes);
 
       setSyncByPair((s) => ({
@@ -250,6 +252,7 @@ export default function DashboardClient(props: {
           totalPlanned,
           isFirstSync,
           quotaRemainingToday: step.quotaRemainingToday,
+          failures: runJson.failures,
         },
       }));
 
@@ -598,6 +601,16 @@ function PairsList(props: {
                   </span>
                   <span className="text-rose-400">! {prog.failed} failed</span>
                   <span>{prog.remaining} remaining</span>
+                  {prog.failures && prog.failures.length > 0 && (
+                    <span className="basis-full text-rose-300">
+                      {prog.failures
+                        .slice(0, 3)
+                        .map(
+                          (f) => `${f.action}: ${f.error ?? "unknown"}`,
+                        )
+                        .join(" · ")}
+                    </span>
+                  )}
                   {prog.status === "paused_quota" && (
                     <span className="ml-auto text-amber-300">
                       Paused — YouTube quota resets at 00:00 Pacific. Remaining
