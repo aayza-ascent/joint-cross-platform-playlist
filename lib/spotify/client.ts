@@ -27,10 +27,12 @@ export class SpotifyClient {
     while (url) {
       const json: PagedPlaylists = await this.request("GET", url);
       for (const p of json.items) {
-        // Spotify's /me/playlists occasionally returns entries with missing
-        // fields for algorithmic/curated playlists (Daily Mix, etc). Skip
-        // anything without an id and tolerate missing tracks/total.
         if (!p?.id) continue;
+        // Spotify-owned editorial / algorithmic playlists (Discover Weekly,
+        // Daily Mix, Top 50 - Global, etc) appear in /me/playlists but cannot
+        // be read via /playlists/{id}/tracks for apps in Development Mode —
+        // they 403 there. Filter them out so users can't pick one.
+        if (p.owner?.id === "spotify") continue;
         out.push({
           id: p.id,
           name: p.name ?? "(untitled)",
@@ -187,6 +189,7 @@ type PagedPlaylists = {
     id?: string;
     name?: string;
     tracks?: { total?: number };
+    owner?: { id?: string };
   } | null>;
 };
 

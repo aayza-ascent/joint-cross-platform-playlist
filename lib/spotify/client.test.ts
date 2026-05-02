@@ -60,6 +60,43 @@ describe("SpotifyClient", () => {
     expect(fn).toHaveBeenCalledTimes(2);
   });
 
+  it("getPlaylists filters out Spotify-owned curated playlists", async () => {
+    // Discover Weekly / Daily Mix / Top 50 — Global are owned by 'spotify' and
+    // 403 on /tracks for apps in Development Mode. Don't surface them in the
+    // picker so the user can't pick one and get a confusing failure later.
+    const { fn } = mockFetch([
+      {
+        status: 200,
+        body: {
+          next: null,
+          items: [
+            {
+              id: "p-mine",
+              name: "My Mix",
+              tracks: { total: 30 },
+              owner: { id: "user123" },
+            },
+            {
+              id: "p-discover",
+              name: "Discover Weekly",
+              tracks: { total: 30 },
+              owner: { id: "spotify" },
+            },
+            {
+              id: "p-top50",
+              name: "Top 50 - Global",
+              tracks: { total: 50 },
+              owner: { id: "spotify" },
+            },
+          ],
+        },
+      },
+    ]);
+    const c = new SpotifyClient(tokenProvider, fn);
+    const playlists = await c.getPlaylists();
+    expect(playlists.map((p) => p.id)).toEqual(["p-mine"]);
+  });
+
   it("getPlaylists tolerates missing/null fields on curated playlists", async () => {
     // Spotify returns malformed entries for some algorithmic playlists
     // (Daily Mix, Discover Weekly): tracks/name can be absent or null.
