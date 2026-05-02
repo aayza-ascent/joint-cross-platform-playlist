@@ -15,7 +15,16 @@ export async function GET() {
           { status: 409 },
         );
       }
-      throw err;
+      const msg = err instanceof Error ? err.message : "unknown";
+      console.error("[playlists/spotify] error:", err);
+      return NextResponse.json(
+        {
+          error: "playlists_failed",
+          provider: "spotify",
+          detail: msg.slice(0, 500),
+        },
+        { status: 500 },
+      );
     }
   });
 }

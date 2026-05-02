@@ -21,18 +21,21 @@ export async function GET() {
         );
       }
       if (err instanceof QuotaExceededError) {
-        return NextResponse.json(
-          { error: "quota_exceeded" },
-          { status: 429 },
-        );
+        return NextResponse.json({ error: "quota_exceeded" }, { status: 429 });
       }
       if (err instanceof YouTubeRateLimitError) {
-        return NextResponse.json(
-          { error: "rate_limited" },
-          { status: 429 },
-        );
+        return NextResponse.json({ error: "rate_limited" }, { status: 429 });
       }
-      throw err;
+      const msg = err instanceof Error ? err.message : "unknown";
+      console.error("[playlists/youtube] error:", err);
+      return NextResponse.json(
+        {
+          error: "playlists_failed",
+          provider: "youtube",
+          detail: msg.slice(0, 500),
+        },
+        { status: 500 },
+      );
     }
   });
 }

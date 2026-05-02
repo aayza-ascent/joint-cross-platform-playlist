@@ -540,17 +540,26 @@ function PairsList(props: {
 // ---- helpers ----
 
 async function handleApi<T>(res: Response): Promise<T> {
+  // Read the body ONCE as text, then attempt to parse. Calling res.json()
+  // and then res.text() (or vice-versa) on the same response throws
+  // "body stream already read" — which previously masked every server
+  // error behind a useless client-side exception.
+  const text = await res.text();
   if (!res.ok) {
-    let detail = "";
+    let detail = text;
     try {
-      const j = await res.json();
-      detail = j.error ?? JSON.stringify(j);
+      const j = JSON.parse(text);
+      detail = j.error ?? j.detail ?? JSON.stringify(j);
     } catch {
-      detail = await res.text();
+      // text wasn't JSON; keep the raw body as detail
     }
-    throw new Error(`${res.status} ${detail.slice(0, 200)}`);
+    throw new Error(`${res.status} ${detail.slice(0, 300)}`);
   }
-  return (await res.json()) as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`Bad JSON from ${res.url}: ${text.slice(0, 200)}`);
+  }
 }
 
 function formatError(err: unknown): string {
