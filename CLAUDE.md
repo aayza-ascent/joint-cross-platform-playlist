@@ -211,7 +211,7 @@ type NormalizedTrack = {
 - Persist tokens via the encryption helper, never plaintext.
 
 **Spotify** (`/api/connect/spotify` + `/api/connect/spotify/callback`):
-- Scopes: `playlist-read-private playlist-modify-private`. **Drop `playlist-modify-public`** — MVP only touches private playlists.
+- Scopes: `playlist-read-private`, `playlist-read-collaborative`, `playlist-modify-private`, `playlist-modify-public`, `user-read-email`, `user-read-private`. Both modify scopes are required because Spotify treats public-vs-private playlist writes as separate grants — without `playlist-modify-public`, writes to a user-owned *public* playlist 403 with an opaque `Forbidden`. Read-email/read-private are needed for the diagnostic endpoint that compares the Spotify-account email against the User Management list.
 - PKCE flow. Code verifier in cookie, code challenge in auth URL.
 - Spotify rotates refresh tokens sometimes — always persist whatever comes back from token exchange/refresh.
 
@@ -286,7 +286,7 @@ If the app is scaffolded but these scripts are missing, add them to `package.jso
 - **Treating YouTube videoId and playlistItemId as the same thing.** They aren't. Removals require `playlistItemId`; record it on every read.
 - **Stringifying Spotify's `artists` array as `track.artists.join(", ")` and matching that against YouTube's `channelTitle`.** Misses many true matches. Always set-compare normalized artist tokens.
 - **Using UTC for the quota reset.** YouTube quota is Pacific. Off by up to 8 hours.
-- **Adding `playlist-modify-public` scope to Spotify because the original spec listed it.** MVP doesn't need it; broader scope = more user friction.
+- **Dropping `playlist-modify-public` from Spotify scopes.** It's required: Spotify treats public-playlist writes as a separate grant. Without it, `POST /playlists/{id}/tracks` 403s on any public playlist the user paired (and Spotify defaults to public for app-created playlists), with no detail in the body.
 - **Using `@supabase/supabase-js` because some snippet referenced it.** This stack is Neon + Drizzle + Auth.js. No Supabase.
 - **Skipping `access_type=offline` on Google OAuth.** First connect works, second doesn't, and you'll spend an hour figuring out why.
 - **Lowercasing-and-dashing `${title}-${artist}` as a match key.** This is what the original spec proposed and what we explicitly rejected. Use the full normalize+fuzzy+ISRC pipeline.

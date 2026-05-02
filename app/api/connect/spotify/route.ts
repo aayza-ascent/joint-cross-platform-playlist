@@ -14,6 +14,13 @@ const SCOPES = [
   // collaborative entries even though /me/playlists happily lists them.
   "playlist-read-collaborative",
   "playlist-modify-private",
+  // playlist-modify-private only authorizes writes to *private* playlists.
+  // Spotify treats public-playlist writes as a separate grant. Without this,
+  // POST /playlists/{id}/tracks 403s on any public playlist the user paired
+  // — even one they own — with no detail beyond {"status":403,"message":
+  // "Forbidden"}. Almost every existing Spotify playlist a user picks via
+  // the playlist picker will be public (Spotify defaults to public).
+  "playlist-modify-public",
   // user-read-email + user-read-private make /v1/me return the account email,
   // product (free/premium), and country. We need email so the user can verify
   // the email registered on their Spotify account matches the email entered
