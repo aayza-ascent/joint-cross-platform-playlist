@@ -18,23 +18,39 @@ export async function GET(
     }
     const items = await db
       .select({
-        spotifyTrackId: syncRunItems.spotifyTrackId,
         action: syncRunItems.action,
         status: syncRunItems.status,
         error: syncRunItems.error,
       })
       .from(syncRunItems)
       .where(eq(syncRunItems.runId, runId));
-    const counts = items.reduce(
-      (acc, it) => {
-        acc.total++;
-        if (it.status === "pending") acc.pending++;
-        if (it.status === "done") acc.done++;
-        if (it.status === "failed") acc.failed++;
-        return acc;
-      },
-      { total: 0, pending: 0, done: 0, failed: 0 },
-    );
-    return NextResponse.json({ run, counts });
+
+    // Per-direction counters split out of items.
+    const c = {
+      total: 0,
+      pending: 0,
+      done: 0,
+      failed: 0,
+      addedYt: 0,
+      addedSp: 0,
+      removedYt: 0,
+      removedSp: 0,
+      skipped: 0,
+    };
+    for (const it of items) {
+      c.total++;
+      if (it.status === "pending") c.pending++;
+      if (it.status === "done") c.done++;
+      if (it.status === "failed") c.failed++;
+      if (it.status === "done") {
+        if (it.action === "add_to_yt" || it.action === "add") c.addedYt++;
+        else if (it.action === "add_to_sp") c.addedSp++;
+        else if (it.action === "remove_from_yt" || it.action === "remove")
+          c.removedYt++;
+        else if (it.action === "remove_from_sp") c.removedSp++;
+        else if (it.action === "skip") c.skipped++;
+      }
+    }
+    return NextResponse.json({ run, counts: c });
   });
 }

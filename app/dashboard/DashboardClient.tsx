@@ -18,9 +18,14 @@ type YtPlaylist = { id: string; title: string; itemCount: number };
 type SyncProgress = {
   runId: string;
   status: "running" | "done" | "failed" | "paused_quota";
-  added: number;
+  addedYt: number;
+  addedSp: number;
+  removedYt: number;
+  removedSp: number;
   failed: number;
   remaining: number;
+  totalPlanned: number;
+  isFirstSync: boolean;
   quotaRemainingToday: number;
   errorDetail?: string;
 };
@@ -118,42 +123,49 @@ export default function DashboardClient(props: {
   }
 
   async function startSync(pairId: string) {
-    setSyncByPair((s) => ({
-      ...s,
-      [pairId]: {
-        runId: "",
-        status: "running",
-        added: 0,
-        failed: 0,
-        remaining: 0,
-        quotaRemainingToday: 0,
-      },
-    }));
+    const baseProgress: SyncProgress = {
+      runId: "",
+      status: "running",
+      addedYt: 0,
+      addedSp: 0,
+      removedYt: 0,
+      removedSp: 0,
+      failed: 0,
+      remaining: 0,
+      totalPlanned: 0,
+      isFirstSync: false,
+      quotaRemainingToday: 0,
+    };
+    setSyncByPair((s) => ({ ...s, [pairId]: baseProgress }));
     try {
       const planRes = await fetch(`/api/sync/${pairId}`, { method: "POST" });
       const plan = await handleApi<{
         runId: string;
         totalItems: number;
-        plannedAdds: number;
+        plannedAddYt: number;
+        plannedAddSp: number;
+        plannedRemoveYt: number;
+        plannedRemoveSp: number;
         plannedSkips: number;
         plannedQuotaUnits: number;
+        isFirstSync: boolean;
       }>(planRes);
       setSyncByPair((s) => ({
         ...s,
-        [pairId]: { ...s[pairId], runId: plan.runId, remaining: plan.totalItems },
+        [pairId]: {
+          ...baseProgress,
+          runId: plan.runId,
+          remaining: plan.totalItems,
+          totalPlanned: plan.totalItems,
+          isFirstSync: plan.isFirstSync,
+        },
       }));
-      await pollUntilDone(pairId, plan.runId);
+      await pollUntilDone(pairId, plan.runId, plan.isFirstSync, plan.totalItems);
     } catch (err) {
       setSyncByPair((s) => ({
         ...s,
         [pairId]: {
-          ...(s[pairId] ?? {
-            runId: "",
-            added: 0,
-            failed: 0,
-            remaining: 0,
-            quotaRemainingToday: 0,
-          }),
+          ...(s[pairId] ?? baseProgress),
           status: "failed",
           errorDetail: formatError(err),
         },
@@ -161,7 +173,12 @@ export default function DashboardClient(props: {
     }
   }
 
-  async function pollUntilDone(pairId: string, runId: string) {
+  async function pollUntilDone(
+    pairId: string,
+    runId: string,
+    isFirstSync: boolean,
+    totalPlanned: number,
+  ) {
     while (true) {
       const stepRes = await fetch(
         `/api/sync/${pairId}/step?runId=${encodeURIComponent(runId)}`,
@@ -174,12 +191,15 @@ export default function DashboardClient(props: {
         quotaRemainingToday: number;
       }>(stepRes);
 
-      // Re-fetch authoritative counters from /runs to keep added/failed in sync.
       const runRes = await fetch(`/api/sync/runs/${encodeURIComponent(runId)}`);
       const runJson = await handleApi<{
-        run: {
-          addedCount: number;
-          failedCount: number;
+        run: { addedCount: number; failedCount: number; removedCount: number };
+        counts: {
+          addedYt: number;
+          addedSp: number;
+          removedYt: number;
+          removedSp: number;
+          failed: number;
         };
       }>(runRes);
 
@@ -188,9 +208,14 @@ export default function DashboardClient(props: {
         [pairId]: {
           runId,
           status: step.status,
-          added: runJson.run.addedCount,
-          failed: runJson.run.failedCount,
+          addedYt: runJson.counts.addedYt,
+          addedSp: runJson.counts.addedSp,
+          removedYt: runJson.counts.removedYt,
+          removedSp: runJson.counts.removedSp,
+          failed: runJson.counts.failed,
           remaining: step.remaining,
+          totalPlanned,
+          isFirstSync,
           quotaRemainingToday: step.quotaRemainingToday,
         },
       }));
@@ -465,24 +490,44 @@ function PairsList(props: {
               </div>
             </div>
             {prog && (
-              <div className="text-xs text-neutral-400 flex items-center gap-3 pt-2 border-t border-neutral-800">
-                <span className="text-emerald-400">+ {prog.added} added</span>
-                <span className="text-rose-400">! {prog.failed} failed</span>
-                <span>{prog.remaining} remaining</span>
-                {prog.status === "paused_quota" && (
-                  <span className="ml-auto text-amber-300">
-                    Paused — YouTube quota resets at 00:00 Pacific. Remaining
-                    today: {prog.quotaRemainingToday}.
+              <div className="space-y-2 pt-2 border-t border-neutral-800">
+                {prog.isFirstSync && prog.status === "running" && (
+                  <div className="text-xs text-amber-300">
+                    First sync for this pair — copying {prog.totalPlanned} tracks
+                    across both sides. Soft-capped at ~150 to stay under
+                    YouTube&apos;s daily quota.
+                  </div>
+                )}
+                <div className="text-xs text-neutral-400 flex items-center gap-3 flex-wrap">
+                  <span className="text-emerald-400">
+                    + {prog.addedYt} → YT
                   </span>
-                )}
-                {prog.status === "done" && (
-                  <span className="ml-auto text-emerald-300">Done.</span>
-                )}
-                {prog.status === "failed" && (
-                  <span className="ml-auto text-rose-300 truncate">
-                    Failed{prog.errorDetail ? ": " + prog.errorDetail : ""}
+                  <span className="text-emerald-400">
+                    + {prog.addedSp} → SP
                   </span>
-                )}
+                  <span className="text-amber-400">
+                    − {prog.removedYt} from YT
+                  </span>
+                  <span className="text-amber-400">
+                    − {prog.removedSp} from SP
+                  </span>
+                  <span className="text-rose-400">! {prog.failed} failed</span>
+                  <span>{prog.remaining} remaining</span>
+                  {prog.status === "paused_quota" && (
+                    <span className="ml-auto text-amber-300">
+                      Paused — YouTube quota resets at 00:00 Pacific. Remaining
+                      today: {prog.quotaRemainingToday}.
+                    </span>
+                  )}
+                  {prog.status === "done" && (
+                    <span className="ml-auto text-emerald-300">Done.</span>
+                  )}
+                  {prog.status === "failed" && (
+                    <span className="ml-auto text-rose-300 truncate">
+                      Failed{prog.errorDetail ? ": " + prog.errorDetail : ""}
+                    </span>
+                  )}
+                </div>
               </div>
             )}
           </article>
