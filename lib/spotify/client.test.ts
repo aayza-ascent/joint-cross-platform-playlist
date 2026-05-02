@@ -169,4 +169,87 @@ describe("SpotifyClient", () => {
     await c.addTracks("p", []);
     expect(fn).toHaveBeenCalledTimes(0);
   });
+
+  it("searchTracks normalizes hits and filters local/non-track", async () => {
+    const { fn, calls } = mockFetch([
+      {
+        status: 200,
+        body: {
+          tracks: {
+            items: [
+              {
+                id: "t1",
+                name: "Halo",
+                duration_ms: 261_000,
+                type: "track",
+                is_local: false,
+                artists: [{ name: "Beyoncé" }],
+                external_ids: { isrc: "USRC10800001" },
+              },
+              {
+                id: "tlocal",
+                name: "Local",
+                duration_ms: 0,
+                type: "track",
+                is_local: true,
+                artists: [{ name: "x" }],
+              },
+              {
+                id: "tep",
+                name: "Show",
+                duration_ms: 1000,
+                type: "episode",
+                is_local: false,
+                artists: [],
+              },
+            ],
+          },
+        },
+      },
+    ]);
+    const c = new SpotifyClient(tokenProvider, fn);
+    const r = await c.searchTracks("Beyoncé Halo");
+    expect(r).toHaveLength(1);
+    expect(r[0]).toMatchObject({
+      source: "spotify",
+      sourceTrackId: "t1",
+      title: "Halo",
+      artists: ["Beyoncé"],
+      durationMs: 261_000,
+      isrc: "USRC10800001",
+    });
+    const url = calls[0].url;
+    expect(url).toContain("/v1/search");
+    expect(url).toMatch(/[?&]type=track\b/);
+    // URLSearchParams encodes spaces as '+', not '%20'.
+    expect(decodeURIComponent(url.replace(/\+/g, " "))).toContain(
+      "q=Beyoncé Halo",
+    );
+  });
+
+  it("searchTracks defaults to limit=5 and clamps to [1, 50]", async () => {
+    const { fn, calls } = mockFetch([
+      { status: 200, body: { tracks: { items: [] } } },
+      { status: 200, body: { tracks: { items: [] } } },
+      { status: 200, body: { tracks: { items: [] } } },
+    ]);
+    const c = new SpotifyClient(tokenProvider, fn);
+    await c.searchTracks("a");
+    await c.searchTracks("b", 9999);
+    await c.searchTracks("c", -3);
+    expect(calls[0].url).toMatch(/[?&]limit=5\b/);
+    expect(calls[1].url).toMatch(/[?&]limit=50\b/);
+    expect(calls[2].url).toMatch(/[?&]limit=1\b/);
+  });
+
+  it("searchTracks retries on 429 honoring Retry-After", async () => {
+    const { fn } = mockFetch([
+      { status: 429, headers: { "retry-after": "0" } },
+      { status: 200, body: { tracks: { items: [] } } },
+    ]);
+    const c = new SpotifyClient(tokenProvider, fn);
+    const r = await c.searchTracks("anything");
+    expect(r).toEqual([]);
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
 });

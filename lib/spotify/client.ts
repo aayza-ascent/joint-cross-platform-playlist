@@ -59,6 +59,24 @@ export class SpotifyClient {
     return out;
   }
 
+  async searchTracks(query: string, limit = 5): Promise<NormalizedTrack[]> {
+    const url = new URL(`${SPOTIFY_API}/search`);
+    url.searchParams.set("q", query);
+    url.searchParams.set("type", "track");
+    url.searchParams.set("limit", String(Math.min(50, Math.max(1, limit))));
+    const json: SearchTracksResponse = await this.request("GET", url.toString());
+    return json.tracks.items
+      .filter((t) => t && !t.is_local && t.type === "track" && t.id)
+      .map((t) => ({
+        source: "spotify" as const,
+        sourceTrackId: t.id,
+        title: t.name,
+        artists: t.artists.map((a) => a.name),
+        durationMs: t.duration_ms,
+        ...(t.external_ids?.isrc && { isrc: t.external_ids.isrc }),
+      }));
+  }
+
   async addTracks(playlistId: string, uris: string[]): Promise<void> {
     if (uris.length === 0) return;
     const calls: Array<Promise<unknown>> = [];
@@ -179,4 +197,8 @@ type SpotifyTrack = {
   is_local: boolean;
   artists: Array<{ name: string }>;
   external_ids?: { isrc?: string };
+};
+
+type SearchTracksResponse = {
+  tracks: { items: SpotifyTrack[] };
 };
