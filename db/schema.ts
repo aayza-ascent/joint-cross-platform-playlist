@@ -101,6 +101,11 @@ export const connectedAccounts = pgTable(
   ],
 );
 
+export type YoutubeBaselineItem = {
+  videoId: string;
+  playlistItemId: string;
+};
+
 export const playlistPairs = pgTable("playlist_pairs", {
   id: text("id")
     .primaryKey()
@@ -114,6 +119,14 @@ export const playlistPairs = pgTable("playlist_pairs", {
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
+  // Baseline written atomically with sync_runs.status='done'. NULL until the
+  // first successful sync. Required for two-way delta detection — without it
+  // we cannot tell "added since last sync" from "removed on the other side."
+  lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
+  lastKnownSpotifyTrackIds: jsonb("last_known_spotify_track_ids").$type<string[]>(),
+  lastKnownYoutubeItems: jsonb(
+    "last_known_youtube_items",
+  ).$type<YoutubeBaselineItem[]>(),
 });
 
 export const trackMappings = pgTable(
@@ -134,6 +147,10 @@ export const trackMappings = pgTable(
   (t) => [
     primaryKey({ columns: [t.userId, t.spotifyTrackId] }),
     index("track_mappings_user_isrc_idx").on(t.userId, t.isrc),
+    // Reverse lookup: 'given a YouTube videoId, do I have a Spotify track for it?'
+    // Used by two-way sync's reverse matching path. Without this index, the
+    // lookup degrades to a per-row scan.
+    index("track_mappings_user_video_idx").on(t.userId, t.youtubeVideoId),
   ],
 );
 
