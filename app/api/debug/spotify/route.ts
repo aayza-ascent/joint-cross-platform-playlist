@@ -59,17 +59,42 @@ export async function GET() {
     }
 
     if (firstId) {
+      const enc = encodeURIComponent(firstId);
+      // Try several variants to figure out which combination Spotify accepts.
+      // /items vs /tracks: Spotify's /me/playlists summary now references
+      // /items as the canonical endpoint; /tracks is older and may be
+      // restricted. market=from_token: some Spotify dev-mode 403s clear when
+      // an explicit market is provided. We log all four so we can see which
+      // succeed.
       out.firstPlaylistAttempt = {
         playlistId: firstId,
         playlistName: firstName,
         ownerId: firstOwner,
-        // No fields= param this time — strips one variable so we can tell
-        // whether the fields param itself is causing trouble.
-        ...(await rawCall(
+        playlistDetails: await rawCall(
           "GET",
-          `https://api.spotify.com/v1/playlists/${encodeURIComponent(firstId)}/tracks?limit=1`,
+          `https://api.spotify.com/v1/playlists/${enc}`,
           accessToken,
-        )),
+        ),
+        tracksNoMarket: await rawCall(
+          "GET",
+          `https://api.spotify.com/v1/playlists/${enc}/tracks?limit=1`,
+          accessToken,
+        ),
+        tracksWithMarket: await rawCall(
+          "GET",
+          `https://api.spotify.com/v1/playlists/${enc}/tracks?limit=1&market=from_token`,
+          accessToken,
+        ),
+        itemsNoMarket: await rawCall(
+          "GET",
+          `https://api.spotify.com/v1/playlists/${enc}/items?limit=1`,
+          accessToken,
+        ),
+        itemsWithMarket: await rawCall(
+          "GET",
+          `https://api.spotify.com/v1/playlists/${enc}/items?limit=1&market=from_token`,
+          accessToken,
+        ),
       };
     } else {
       out.firstPlaylistAttempt = { skipped: "no user-owned playlists found" };
