@@ -188,8 +188,10 @@ export class SpotifyClient {
 }
 
 export class SpotifyApiError extends Error {
+  public body: string;
   constructor(public status: number, body: string) {
     super(`spotify ${status}: ${body.slice(0, 200)}`);
+    this.body = body;
   }
 }
 

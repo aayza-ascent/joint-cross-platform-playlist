@@ -66,7 +66,8 @@ export async function POST(req: NextRequest) {
           {
             error: "spotify_forbidden",
             detail:
-              "Spotify rejected the create with 403 Forbidden. This usually means your Spotify connection was authorized before we added a needed scope. Disconnect Spotify under Provider connections, then click Connect Spotify to grant the updated permissions, then retry.",
+              "Spotify rejected the create with 403 Forbidden. If you've already disconnected and reconnected Spotify, the most likely remaining cause is that your Spotify account isn't on this app's User Management list. Open developer.spotify.com → your app → User Management → Add new user → enter the email of the Spotify account you signed in with, then retry. (Apps in Development Mode can only be used by explicitly listed users — including the developer.) See /api/debug/spotify for the raw Spotify response.",
+            spotifyBody: err.body.slice(0, 500),
           },
           { status: 422 },
         );

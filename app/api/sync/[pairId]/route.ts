@@ -37,15 +37,12 @@ export async function POST(
         );
       }
       if (err instanceof SpotifyApiError && err.status === 403) {
-        // Most likely cause: the user's Spotify connection was authorized
-        // before we added a scope it now needs (e.g. playlist-read-collaborative).
-        // Spotify silently keeps the old grant unless we force re-consent, so
-        // tell the user to disconnect and reconnect to refresh scopes.
         return NextResponse.json(
           {
             error: "spotify_forbidden",
             detail:
-              "Spotify rejected the read with 403 Forbidden. This usually means your Spotify connection was authorized before we added a needed scope — most often 'Read collaborative playlists'. Click Disconnect on the Spotify card under Provider connections, then click Connect Spotify to grant the updated permissions, then retry Sync now.",
+              "Spotify rejected the read with 403 Forbidden. If you've already disconnected and reconnected Spotify, the most likely remaining cause is that your Spotify account isn't on this app's User Management list. Open developer.spotify.com → your app → User Management → Add new user → enter the email of the Spotify account you signed in with, then retry. (Apps in Development Mode can only be used by explicitly listed users — including the developer.) See /api/debug/spotify for the raw Spotify response.",
+            spotifyBody: err.body.slice(0, 500),
           },
           { status: 422 },
         );
