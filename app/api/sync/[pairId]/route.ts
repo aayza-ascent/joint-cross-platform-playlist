@@ -41,7 +41,7 @@ export async function POST(
           {
             error: "spotify_forbidden",
             detail:
-              "Spotify rejected the read with 403 Forbidden. If you've already disconnected and reconnected Spotify, the most likely remaining cause is that your Spotify account isn't on this app's User Management list. Open developer.spotify.com → your app → User Management → Add new user → enter the email of the Spotify account you signed in with, then retry. (Apps in Development Mode can only be used by explicitly listed users — including the developer.) See /api/debug/spotify for the raw Spotify response.",
+              "Spotify returned 403 Forbidden. Apps in Development Mode can only act on data of users explicitly listed in the app's User Management section — including the developer. Open https://developer.spotify.com/dashboard → your app → Settings → User Management → Add new user. Use the email of your Spotify account (NOT your Google sign-in email — they may differ; check https://www.spotify.com/account/profile/). After saving, retry — no reconnect needed.",
             spotifyBody: err.body.slice(0, 500),
           },
           { status: 422 },
