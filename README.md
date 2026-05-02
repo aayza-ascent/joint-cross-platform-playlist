@@ -95,6 +95,12 @@ npm run dev
 Sign in with Google → connect Spotify → connect YouTube → pick one playlist
 each → Create pair → Sync now.
 
+> **If you connected Spotify before the `playlist-read-collaborative` scope
+> was added** (anyone using a deployment from before that change), click
+> Disconnect on the Spotify card and Connect Spotify again. Spotify won't
+> silently upgrade an existing grant to include the new scope, and Sync now
+> will 403 on collaborative playlists until you do this.
+
 ## Scripts
 
 ```bash

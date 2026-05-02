@@ -7,7 +7,14 @@ import {
 } from "@/lib/auth/oauth";
 import { withSession } from "@/lib/auth/session";
 
-const SCOPES = ["playlist-read-private", "playlist-modify-private"];
+const SCOPES = [
+  "playlist-read-private",
+  // Required to read tracks of any playlist marked Collaborative — including
+  // the user's own. Without this scope, GET /v1/playlists/{id}/tracks 403s on
+  // collaborative entries even though /me/playlists happily lists them.
+  "playlist-read-collaborative",
+  "playlist-modify-private",
+];
 
 export async function GET() {
   return withSession(async () => {
@@ -31,6 +38,11 @@ export async function GET() {
     url.searchParams.set("state", state);
     url.searchParams.set("code_challenge_method", "S256");
     url.searchParams.set("code_challenge", challenge);
+    // Force Spotify to re-show the consent screen so any user that previously
+    // connected with a smaller scope set re-grants with the current scopes.
+    // Without this, Spotify silently re-issues a token whose grants don't
+    // include any newly-added scope.
+    url.searchParams.set("show_dialog", "true");
     return NextResponse.redirect(url.toString());
   });
 }
