@@ -127,14 +127,15 @@ describe("SpotifyClient", () => {
   });
 
   it("normalizes playlist tracks and skips local/non-track items", async () => {
-    const { fn } = mockFetch([
+    // /items uses `item` per row, not `track` (the old /tracks shape).
+    const { fn, calls } = mockFetch([
       {
         status: 200,
         body: {
           next: null,
           items: [
             {
-              track: {
+              item: {
                 id: "t1",
                 name: "Halo",
                 duration_ms: 261_000,
@@ -144,9 +145,9 @@ describe("SpotifyClient", () => {
                 external_ids: { isrc: "USRC10800001" },
               },
             },
-            { track: null },
+            { item: null },
             {
-              track: {
+              item: {
                 id: "tlocal",
                 name: "Local file",
                 duration_ms: 0,
@@ -156,7 +157,7 @@ describe("SpotifyClient", () => {
               },
             },
             {
-              track: {
+              item: {
                 id: "tep",
                 name: "Episode",
                 duration_ms: 1000,
@@ -171,6 +172,9 @@ describe("SpotifyClient", () => {
     ]);
     const c = new SpotifyClient(tokenProvider, fn);
     const tracks = await c.getPlaylistTracks("plist");
+    // Confirm we hit /items, not the deprecated /tracks endpoint.
+    expect(calls[0].url).toContain("/playlists/plist/items");
+    expect(calls[0].url).not.toContain("/playlists/plist/tracks");
     expect(tracks).toHaveLength(1);
     expect(tracks[0]).toMatchObject({
       source: "spotify",

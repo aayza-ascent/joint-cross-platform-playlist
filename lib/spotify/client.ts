@@ -46,14 +46,18 @@ export class SpotifyClient {
 
   async getPlaylistTracks(playlistId: string): Promise<NormalizedTrack[]> {
     const out: NormalizedTrack[] = [];
+    // Spotify retired /playlists/{id}/tracks for read access in Development
+    // Mode (returns 403 Forbidden); the canonical endpoint is /items, which
+    // also matches the href Spotify returns from /me/playlists. The payload
+    // shape is identical except each row carries `item` instead of `track`.
     let url: string | null =
       `${SPOTIFY_API}/playlists/${encodeURIComponent(
         playlistId,
-      )}/tracks?limit=100&fields=next,items(track(id,name,duration_ms,artists(name),external_ids(isrc),is_local,type))`;
+      )}/items?limit=100&fields=next,items(item(id,name,duration_ms,artists(name),external_ids(isrc),is_local,type))`;
     while (url) {
-      const json: PagedPlaylistTracks = await this.request("GET", url);
+      const json: PagedPlaylistItems = await this.request("GET", url);
       for (const it of json.items) {
-        const t = it.track;
+        const t = it.item;
         if (!t || t.is_local || t.type !== "track" || !t.id) continue;
         out.push({
           source: "spotify",
@@ -217,10 +221,10 @@ type PagedPlaylists = {
   } | null>;
 };
 
-type PagedPlaylistTracks = {
+type PagedPlaylistItems = {
   next: string | null;
   items: Array<{
-    track: SpotifyTrack | null;
+    item: SpotifyTrack | null;
   }>;
 };
 
