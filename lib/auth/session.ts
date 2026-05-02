@@ -1,4 +1,5 @@
 import { auth } from "@/lib/auth/authjs";
+import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 
 export class UnauthorizedError extends Error {
@@ -10,7 +11,22 @@ export class UnauthorizedError extends Error {
 export async function requireSession(): Promise<{ userId: string }> {
   const session = await auth();
   const id = session?.user?.id;
-  if (!id) throw new UnauthorizedError();
+  if (!id) {
+    if (process.env.NODE_ENV !== "production") {
+      const jar = await cookies();
+      const names = jar.getAll().map((c) => c.name);
+      console.warn(
+        "[auth] requireSession failed:",
+        JSON.stringify({
+          hasSessionObject: !!session,
+          hasSessionUser: !!session?.user,
+          sessionUserKeys: session?.user ? Object.keys(session.user) : null,
+          cookieNames: names,
+        }),
+      );
+    }
+    throw new UnauthorizedError();
+  }
   return { userId: id };
 }
 
