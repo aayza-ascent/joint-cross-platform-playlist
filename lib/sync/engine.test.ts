@@ -197,6 +197,41 @@ function makeEngine(args: {
 
 // ---- tests ----
 
+describe("InMemorySyncStore reverse mapping", () => {
+  it("getMappingsByVideoIds returns only this user's mappings keyed by videoId", async () => {
+    const s = new InMemorySyncStore();
+    await s.upsertMapping({
+      userId: "u1",
+      spotifyTrackId: "t1",
+      youtubeVideoId: "v1",
+      isrc: null,
+      confidence: 1,
+      matchMethod: "manual",
+    });
+    await s.upsertMapping({
+      userId: "u1",
+      spotifyTrackId: "t2",
+      youtubeVideoId: "v2",
+      isrc: null,
+      confidence: 1,
+      matchMethod: "manual",
+    });
+    await s.upsertMapping({
+      userId: "u-other",
+      spotifyTrackId: "t-other",
+      youtubeVideoId: "v1",
+      isrc: null,
+      confidence: 1,
+      matchMethod: "manual",
+    });
+    const m = await s.getMappingsByVideoIds("u1", ["v1", "v2", "v-missing"]);
+    expect(m.size).toBe(2);
+    expect(m.get("v1")?.spotifyTrackId).toBe("t1");
+    expect(m.get("v2")?.spotifyTrackId).toBe("t2");
+    expect(m.has("v-missing")).toBe(false);
+  });
+});
+
 describe("planRun", () => {
   it("creates a sync_runs row plus one item per Spotify track", async () => {
     const { engine, store, pairId } = makeEngine({

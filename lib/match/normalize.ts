@@ -22,6 +22,17 @@ const PARENS_NOISE = new RegExp(
       "album\\s+version",
       "explicit",
       "clean",
+      // YouTube-side noise commonly attached to music video titles
+      "official(\\s+(music\\s+)?video|\\s+audio)?",
+      "music\\s+video",
+      "lyric(s)?\\s+video",
+      "lyrics?",
+      "audio",
+      "video",
+      "hd",
+      "4k",
+      "hq",
+      "visualizer",
     ].join("|") +
     ")\\b[^\\)\\]]*[\\)\\]]",
   "gi",
@@ -94,16 +105,41 @@ export function jaccard(a: string[], b: string[]): number {
   return union === 0 ? 0 : inter / union;
 }
 
+function tokenizeTitle(s: string): string[] {
+  return s
+    .split(/[\s\-]+/u)
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
 // Token-set Jaccard for titles, after splitting on whitespace AND hyphens
 // (so "jay-z" and "jay z" tokenize the same way).
 export function titleTokenJaccard(a: string, b: string): number {
-  const tokenize = (s: string) =>
-    s.split(/[\s\-]+/u).map((t) => t.trim()).filter(Boolean);
-  return jaccard(tokenize(a), tokenize(b));
+  return jaccard(tokenizeTitle(a), tokenizeTitle(b));
+}
+
+// "Is the shorter title contained inside the longer one?" Useful for the
+// common YouTube pattern where the title repeats the artist ("Beyoncé - Halo")
+// but the Spotify title is just "Halo". Single-token titles ("Halo") match
+// any longer title containing them; false-positive risk is held in check by
+// the artist-Jaccard and duration components of the composite score.
+export function titleContainment(a: string, b: string): number {
+  const ta = new Set(tokenizeTitle(a));
+  const tb = new Set(tokenizeTitle(b));
+  if (ta.size === 0 || tb.size === 0) return 0;
+  const smaller = ta.size <= tb.size ? ta : tb;
+  const larger = ta.size <= tb.size ? tb : ta;
+  let inter = 0;
+  for (const t of smaller) if (larger.has(t)) inter++;
+  return inter / smaller.size;
 }
 
 export function titleSimilarity(a: string, b: string): number {
-  return Math.max(fuzzy(a, b) as number, titleTokenJaccard(a, b));
+  return Math.max(
+    fuzzy(a, b) as number,
+    titleTokenJaccard(a, b),
+    titleContainment(a, b),
+  );
 }
 
 export function durationScore(aMs: number, bMs: number): number {
@@ -151,8 +187,10 @@ export function scoreCandidate(
 
 export const AUTO_ACCEPT_THRESHOLD = 0.75;
 
-export function matchSpotifyToYouTube(
-  spotify: NormalizedTrack,
+// Generic two-side matcher. The forward and reverse helpers below are thin
+// wrappers that just name the parameters semantically.
+function pickMatch(
+  query: NormalizedTrack,
   candidates: NormalizedTrack[],
   knownIsrcMap?: Map<string, string>,
 ): {
@@ -160,12 +198,12 @@ export function matchSpotifyToYouTube(
   topN: ScoredCandidate[];
   result: MatchResult | null;
 } {
-  if (spotify.isrc && knownIsrcMap?.has(spotify.isrc)) {
-    const videoId = knownIsrcMap.get(spotify.isrc)!;
+  if (query.isrc && knownIsrcMap?.has(query.isrc)) {
+    const matchedId = knownIsrcMap.get(query.isrc)!;
     return {
       best: null,
       topN: [],
-      result: { videoId, confidence: 1, method: "isrc" },
+      result: { videoId: matchedId, confidence: 1, method: "isrc" },
     };
   }
 
@@ -174,7 +212,7 @@ export function matchSpotifyToYouTube(
   }
 
   const scored = candidates
-    .map((c) => scoreCandidate(spotify, c))
+    .map((c) => scoreCandidate(query, c))
     .sort((a, b) => b.score - a.score);
 
   const best = scored[0];
@@ -192,3 +230,32 @@ export function matchSpotifyToYouTube(
   }
   return { best, topN, result: null };
 }
+
+export function matchSpotifyToYouTube(
+  spotify: NormalizedTrack,
+  candidates: NormalizedTrack[],
+  knownIsrcMap?: Map<string, string>,
+): {
+  best: ScoredCandidate | null;
+  topN: ScoredCandidate[];
+  result: MatchResult | null;
+} {
+  return pickMatch(spotify, candidates, knownIsrcMap);
+}
+
+// Reverse direction: given a YouTube track, find the best Spotify candidate.
+// Reuses the same scoring (it's symmetric — title+artist+duration doesn't care
+// which side a track came from). MatchResult.videoId is misleadingly named —
+// for this direction it's a Spotify trackId.
+export function matchYouTubeToSpotify(
+  youtube: NormalizedTrack,
+  candidates: NormalizedTrack[],
+  knownIsrcMap?: Map<string, string>,
+): {
+  best: ScoredCandidate | null;
+  topN: ScoredCandidate[];
+  result: MatchResult | null;
+} {
+  return pickMatch(youtube, candidates, knownIsrcMap);
+}
+

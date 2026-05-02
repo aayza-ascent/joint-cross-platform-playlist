@@ -68,6 +68,15 @@ export interface SyncStore {
     isrcs: string[],
   ): Promise<Map<string, Mapping>>;
 
+  // Reverse lookup: given a list of YouTube videoIds, return any mappings
+  // that point to them. Keyed by videoId. Used by the two-way add_to_sp
+  // path to short-circuit Spotify search when we've matched this video
+  // before.
+  getMappingsByVideoIds(
+    userId: string,
+    videoIds: string[],
+  ): Promise<Map<string, Mapping>>;
+
   createSyncRun(args: {
     pairId: string;
     userId: string;
@@ -182,6 +191,33 @@ export class DrizzleSyncStore implements SyncStore {
           spotifyTrackId: r.spotifyTrackId,
           youtubeVideoId: r.youtubeVideoId,
           isrc: r.isrc,
+        });
+      }
+    }
+    return out;
+  }
+
+  async getMappingsByVideoIds(
+    userId: string,
+    videoIds: string[],
+  ): Promise<Map<string, Mapping>> {
+    if (videoIds.length === 0) return new Map();
+    const rows = await this.db
+      .select()
+      .from(trackMappings)
+      .where(
+        and(
+          eq(trackMappings.userId, userId),
+          inArray(trackMappings.youtubeVideoId, videoIds),
+        ),
+      );
+    const out = new Map<string, Mapping>();
+    for (const r of rows) {
+      if (!out.has(r.youtubeVideoId)) {
+        out.set(r.youtubeVideoId, {
+          spotifyTrackId: r.spotifyTrackId,
+          youtubeVideoId: r.youtubeVideoId,
+          isrc: r.isrc ?? undefined,
         });
       }
     }
@@ -398,6 +434,19 @@ export class InMemorySyncStore implements SyncStore {
       if (m.userId !== userId) continue;
       if (m.isrc && isrcs.includes(m.isrc) && !out.has(m.isrc)) {
         out.set(m.isrc, m);
+      }
+    }
+    return out;
+  }
+
+  async getMappingsByVideoIds(userId: string, videoIds: string[]) {
+    const out = new Map<string, Mapping>();
+    if (videoIds.length === 0) return out;
+    const set = new Set(videoIds);
+    for (const m of this.mappings.values()) {
+      if (m.userId !== userId) continue;
+      if (set.has(m.youtubeVideoId) && !out.has(m.youtubeVideoId)) {
+        out.set(m.youtubeVideoId, m);
       }
     }
     return out;

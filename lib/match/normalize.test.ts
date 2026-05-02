@@ -5,6 +5,7 @@ import {
   extractFeatured,
   jaccard,
   matchSpotifyToYouTube,
+  matchYouTubeToSpotify,
   normalizeArtists,
   normalizeTitle,
   scoreCandidate,
@@ -309,5 +310,80 @@ describe("matchSpotifyToYouTube", () => {
     expect(r.result).toBeNull();
     expect(r.topN).toEqual([]);
     expect(r.best).toBeNull();
+  });
+});
+
+describe("matchYouTubeToSpotify (reverse direction)", () => {
+  it("matches a clean YouTube video to a Spotify track via fuzzy", () => {
+    // The query is a YouTube track; candidates are Spotify tracks.
+    const yt: NormalizedTrack = {
+      source: "youtube",
+      sourceTrackId: "v-yt",
+      title: "Beyoncé - Halo (Official Music Video)",
+      artists: ["BeyoncéVEVO"],
+      durationMs: 264_000,
+    };
+    const candidates: NormalizedTrack[] = [
+      {
+        source: "spotify",
+        sourceTrackId: "sp-halo",
+        title: "Halo",
+        artists: ["Beyoncé"],
+        durationMs: 261_000,
+        isrc: "USRC10800001",
+      },
+      {
+        source: "spotify",
+        sourceTrackId: "sp-other",
+        title: "Bohemian Rhapsody",
+        artists: ["Queen"],
+        durationMs: 354_000,
+      },
+    ];
+    const r = matchYouTubeToSpotify(yt, candidates);
+    expect(r.result).not.toBeNull();
+    expect(r.result?.videoId).toBe("sp-halo"); // field name carries trackId in reverse direction
+    expect(r.result?.confidence).toBeGreaterThan(AUTO_ACCEPT_THRESHOLD);
+  });
+
+  it("single-word containment alone is not enough — wrong artist+duration rejects", () => {
+    // "Love" appears as a token in the YT title, but the artist is unrelated
+    // and the duration is wildly off. The composite score must reject this.
+    const yt: NormalizedTrack = {
+      source: "youtube",
+      sourceTrackId: "v-yt",
+      title: "I Love My Cat (Vlog Episode 47)",
+      artists: ["Random Vlogger"],
+      durationMs: 600_000,
+    };
+    const sp: NormalizedTrack = {
+      source: "spotify",
+      sourceTrackId: "sp-love",
+      title: "Love",
+      artists: ["Lana Del Rey"],
+      durationMs: 264_000,
+    };
+    const r = matchYouTubeToSpotify(yt, [sp]);
+    expect(r.result).toBeNull();
+  });
+
+  it("returns null when no Spotify candidate clears threshold", () => {
+    const yt: NormalizedTrack = {
+      source: "youtube",
+      sourceTrackId: "v-yt",
+      title: "Some Random Channel Daily Vlog",
+      artists: ["Random Vlogger"],
+      durationMs: 600_000,
+    };
+    const r = matchYouTubeToSpotify(yt, [
+      {
+        source: "spotify",
+        sourceTrackId: "sp-completely-unrelated",
+        title: "Toxic",
+        artists: ["Britney Spears"],
+        durationMs: 198_000,
+      },
+    ]);
+    expect(r.result).toBeNull();
   });
 });
