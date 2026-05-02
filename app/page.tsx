@@ -14,10 +14,12 @@ export default async function Home() {
     <main className="min-h-screen flex items-center justify-center p-6 bg-neutral-950 text-neutral-100">
       <div className="max-w-md w-full space-y-8">
         <div>
+          <p className="text-xs text-neutral-500 mb-3">hi from aayza 👋</p>
           <h1 className="text-3xl font-semibold">Playlist Sync</h1>
           <p className="mt-2 text-neutral-400 text-sm">
-            One-way sync from a Spotify playlist to a YouTube playlist. Press
-            Sync Now whenever you want them aligned.
+            Two-way sync between a Spotify playlist and a YouTube playlist.
+            Add or remove a track on either side, press Sync Now, and both
+            playlists end up matching.
           </p>
         </div>
         <form action={googleSignIn}>
