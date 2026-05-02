@@ -14,6 +14,13 @@ const SCOPES = [
   // collaborative entries even though /me/playlists happily lists them.
   "playlist-read-collaborative",
   "playlist-modify-private",
+  // user-read-email + user-read-private make /v1/me return the account email,
+  // product (free/premium), and country. We need email so the user can verify
+  // the email registered on their Spotify account matches the email entered
+  // in the dev dashboard's User Management list (a mismatch causes 403 on all
+  // writes in Development Mode, with no detail in the response body).
+  "user-read-email",
+  "user-read-private",
 ];
 
 export async function GET() {
