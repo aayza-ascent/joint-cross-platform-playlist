@@ -259,6 +259,19 @@ export class YouTubeClient {
         throw new YouTubeApiError(res.status, text);
       }
 
+      // Transient 5xx (502/503/504 — gateway/upstream errors) → retry with
+      // backoff. Without this, a single bad-luck response from Google's edge
+      // marks the item failed for the rest of the run even though the next
+      // call would have succeeded.
+      if (res.status >= 500 && res.status < 600) {
+        if (attempt < MAX_RETRIES - 1) {
+          await sleep(backoffMs(attempt));
+          continue;
+        }
+        const text = await safeText(res);
+        throw new YouTubeApiError(res.status, text);
+      }
+
       if (!res.ok) {
         const text = await safeText(res);
         throw new YouTubeApiError(res.status, text);

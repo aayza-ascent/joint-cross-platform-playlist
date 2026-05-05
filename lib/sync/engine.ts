@@ -1,7 +1,7 @@
 import type { SpotifyClient } from "@/lib/spotify/client";
 import type { YouTubeClient } from "@/lib/youtube/client";
 import { QuotaExceededError } from "@/lib/youtube/client";
-import type { QuotaAccounter } from "@/lib/youtube/quota";
+import { nextPacificMidnight, type QuotaAccounter } from "@/lib/youtube/quota";
 import {
   matchSpotifyToYouTube,
   matchYouTubeToSpotify,
@@ -75,6 +75,10 @@ export type StepResult = {
   remaining: number;
   status: StepStatus;
   quotaRemainingToday: number;
+  // ISO timestamp of the next Pacific midnight — only meaningful while the
+  // YouTube quota is the limiting factor, but cheap to always include so
+  // the UI can render a "resumes in X" countdown without extra round-trips.
+  nextQuotaResetAt: string;
 };
 
 export type EngineDeps = {
@@ -380,6 +384,7 @@ export class SyncEngine {
         remaining: 0,
         status: run.status,
         quotaRemainingToday: await this.deps.quota.remaining(),
+        nextQuotaResetAt: nextPacificMidnight(this.now()).toISOString(),
       };
     }
 
@@ -396,21 +401,35 @@ export class SyncEngine {
         remaining: 0,
         status: "done",
         quotaRemainingToday: await this.deps.quota.remaining(),
+        nextQuotaResetAt: nextPacificMidnight(this.now()).toISOString(),
       };
     }
 
-    // Quota guard — only matters for items that will hit the YouTube API.
-    const ytCostingItems = items.filter(
-      (it) => it.action === "add_to_yt" || it.action === "remove_from_yt",
-    ).length;
+    // Quota guard — sum the worst-case YouTube cost for THIS batch instead
+    // of refusing whenever any single search.list cost (100) might fit.
+    // Without this, a step holding only `add_to_yt` items with cached
+    // videoIds (50 units each) gets paused at 99 remaining, even though
+    // the actual work fits comfortably.
     const remainingQuota = await this.deps.quota.remaining();
-    if (ytCostingItems > 0 && remainingQuota < QUOTA_GUARD_FOR_SEARCH) {
+    const batchCost = items.reduce(
+      (sum, it) =>
+        sum + estimateYtCost(it.action, Boolean(it.youtubeVideoId)),
+      0,
+    );
+    const ytCostingItems = items.filter(
+      (it) => estimateYtCost(it.action, Boolean(it.youtubeVideoId)) > 0,
+    ).length;
+    if (
+      (ytCostingItems > 0 && remainingQuota < batchCost + QUOTA_HARD_FLOOR) ||
+      remainingQuota < QUOTA_HARD_FLOOR
+    ) {
       await store.updateSyncRun(runId, { status: "paused_quota" });
       return {
         processed: 0,
         remaining: items.length,
         status: "paused_quota",
         quotaRemainingToday: remainingQuota,
+        nextQuotaResetAt: nextPacificMidnight(this.now()).toISOString(),
       };
     }
 
@@ -550,6 +569,7 @@ export class SyncEngine {
         remaining: items.length - processed,
         status: "paused_quota",
         quotaRemainingToday: afterQuota,
+        nextQuotaResetAt: nextPacificMidnight(this.now()).toISOString(),
       };
     }
 
@@ -561,6 +581,7 @@ export class SyncEngine {
         remaining: 0,
         status: "done",
         quotaRemainingToday: afterQuota,
+        nextQuotaResetAt: nextPacificMidnight(this.now()).toISOString(),
       };
     }
 
@@ -569,6 +590,7 @@ export class SyncEngine {
       remaining: stillPending.length,
       status: "running",
       quotaRemainingToday: afterQuota,
+      nextQuotaResetAt: nextPacificMidnight(this.now()).toISOString(),
     };
   }
 
@@ -723,12 +745,21 @@ export class SyncEngine {
       });
     }
 
+    // Capture the playlistItemId returned by addToPlaylist. Persisting it
+    // makes a future remove_from_yt independent of the end-of-run baseline
+    // read — if commitDone's read fails (transient 5xx, timeout), we still
+    // know exactly which row to delete next time.
+    let playlistItemId: string | null = item.youtubePlaylistItemId;
     if (!alreadyInserted.has(videoId)) {
-      await youtube.addToPlaylist(pair.youtubePlaylistId, videoId);
+      playlistItemId = await youtube.addToPlaylist(
+        pair.youtubePlaylistId,
+        videoId,
+      );
     }
     await store.updateSyncRunItem(item.id, {
       status: "done",
       youtubeVideoId: videoId,
+      ...(playlistItemId && { youtubePlaylistItemId: playlistItemId }),
     });
     return { videoId };
   }

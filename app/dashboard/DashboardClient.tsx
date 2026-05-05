@@ -45,6 +45,9 @@ type SyncProgress = {
   totalPlanned: number;
   isFirstSync: boolean;
   quotaRemainingToday: number;
+  // ISO; populated from step responses so the UI can render a live
+  // countdown ("resumes in 3h 12m") instead of a generic "00:00 Pacific".
+  nextQuotaResetAt?: string;
   errorDetail?: string;
   failures?: Failure[];
 };
@@ -174,6 +177,26 @@ export default function DashboardClient(props: {
     if (res.ok) setPairs((ps) => ps.filter((p) => p.id !== pairId));
   }
 
+  async function cancelSync(pairId: string) {
+    // Best-effort: the route conditionally writes status='failed' so a
+    // racing commitDone won't be clobbered. After cancelling we update
+    // local state immediately; the next user click on Sync now starts a
+    // fresh plan instead of resuming.
+    try {
+      await fetch(`/api/sync/${pairId}/cancel`, { method: "POST" });
+    } catch {
+      // swallow — local state update below still gets the user unstuck
+    }
+    setSyncByPair((s) => {
+      const cur = s[pairId];
+      if (!cur) return s;
+      return {
+        ...s,
+        [pairId]: { ...cur, status: "failed", errorDetail: "cancelled" },
+      };
+    });
+  }
+
   async function startSync(pairId: string) {
     const baseProgress: SyncProgress = {
       runId: "",
@@ -246,6 +269,7 @@ export default function DashboardClient(props: {
         remaining: number;
         status: "running" | "done" | "failed" | "paused_quota";
         quotaRemainingToday: number;
+        nextQuotaResetAt?: string;
       }>(stepRes);
 
       const runRes = await fetch(`/api/sync/runs/${encodeURIComponent(runId)}`);
@@ -275,6 +299,7 @@ export default function DashboardClient(props: {
           totalPlanned,
           isFirstSync,
           quotaRemainingToday: step.quotaRemainingToday,
+          nextQuotaResetAt: step.nextQuotaResetAt,
           failures: runJson.failures,
         },
       }));
@@ -343,6 +368,7 @@ export default function DashboardClient(props: {
         spotifyById={mapBy(spPlaylists ?? [], (p) => p.id)}
         youtubeById={mapBy(ytPlaylists ?? [], (p) => p.id)}
         onSync={startSync}
+        onCancel={cancelSync}
         onDelete={deletePair}
       />
     </div>
@@ -568,6 +594,7 @@ function PairsList(props: {
   spotifyById: Map<string, SpPlaylist>;
   youtubeById: Map<string, YtPlaylist>;
   onSync: (pairId: string) => void;
+  onCancel: (pairId: string) => void;
   onDelete: (pairId: string) => void;
 }) {
   if (props.pairs.length === 0) {
@@ -614,6 +641,15 @@ function PairsList(props: {
                 >
                   {prog?.status === "running" ? "Syncing…" : "Sync now"}
                 </button>
+                {(prog?.status === "running" ||
+                  prog?.status === "paused_quota") && (
+                  <button
+                    onClick={() => props.onCancel(p.id)}
+                    className="rounded-md border border-neutral-700 text-neutral-300 px-3 py-1.5 text-xs hover:border-rose-500 hover:text-rose-300 transition"
+                  >
+                    Cancel
+                  </button>
+                )}
                 <button
                   onClick={() => props.onDelete(p.id)}
                   className="text-xs text-neutral-400 hover:text-neutral-100"
@@ -651,9 +687,12 @@ function PairsList(props: {
                   )}
                   {prog.status === "paused_quota" && (
                     <span className="ml-auto text-amber-300">
-                      Paused — YouTube quota resets at 00:00 Pacific. Remaining
-                      today: {prog.quotaRemainingToday}. Press Sync now after
-                      reset to resume.
+                      Paused — YouTube quota
+                      {prog.nextQuotaResetAt
+                        ? ` resumes in ${formatCountdown(prog.nextQuotaResetAt)}`
+                        : " resets at 00:00 Pacific"}
+                      . Remaining today: {prog.quotaRemainingToday}. Press Sync
+                      now after reset to resume.
                     </span>
                   )}
                   {prog.status === "done" && prog.failed === 0 && (
@@ -834,6 +873,19 @@ function translateItemFailure(action: string, error: string | null): string {
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// Render an ISO timestamp as a coarse human countdown. Static — re-renders
+// only happen on the next poll tick (~1.5s), which is granular enough for
+// "resumes in 3h 12m" to be accurate-ish.
+function formatCountdown(iso: string): string {
+  const ms = new Date(iso).getTime() - Date.now();
+  if (ms <= 0) return "now";
+  const totalMin = Math.round(ms / 60_000);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  if (h <= 0) return `${m}m`;
+  return `${h}h ${m}m`;
 }
 
 function mapBy<T, K>(arr: T[], keyFn: (t: T) => K): Map<K, T> {

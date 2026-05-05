@@ -483,6 +483,22 @@ describe("stepRun: dispatch and idempotency", () => {
     expect(store.baselines.get(pairId)?.youtubeItems[0]?.videoId).toBe("v1");
   });
 
+  it("persists the playlistItemId returned by addToPlaylist on the item row", async () => {
+    // Regression: previously the engine threw away the playlistItemId from
+    // `addToPlaylist`, so future remove_from_yt for the same track had to
+    // wait for the next baseline read to learn its ID. Capture verifies
+    // the row was updated in-place during the step.
+    const { engine, store, pairId } = makeEngine({
+      spTracks: [sp({ id: "t1", title: "A", artists: ["X"], durationMs: 100 })],
+      preMappings: [{ spotifyTrackId: "t1", youtubeVideoId: "v1" }],
+    });
+    const plan = await engine.planRun(pairId);
+    await engine.stepRun(plan.runId);
+    const items = store.items.get(plan.runId) ?? [];
+    const addItem = items.find((it) => it.action === "add_to_yt");
+    expect(addItem?.youtubePlaylistItemId).toBe("pi-v1");
+  });
+
   it("processes remove_from_yt using playlistItemId from baseline", async () => {
     const { engine, pairId, youtube, store } = makeEngine({
       spTracks: [],
@@ -661,5 +677,19 @@ describe("stepRun: dispatch and idempotency", () => {
     expect(step.status).toBe("paused_quota");
     expect(store.runs.get(plan.runId)!.status).toBe("paused_quota");
     expect(store.baselines.has(pairId)).toBe(false);
+  });
+
+  it("admits a step whose actual cost fits even when below 100 remaining", async () => {
+    // With a cached mapping, add_to_yt costs 50 (insert only), not 101+50.
+    // Old guard refused at <100 remaining; new guard checks the actual
+    // batch cost + a small safety floor.
+    const { engine, pairId } = makeEngine({
+      spTracks: [sp({ id: "t1", title: "A", artists: ["X"], durationMs: 100 })],
+      preMappings: [{ spotifyTrackId: "t1", youtubeVideoId: "v1" }],
+      preQuotaUsed: 9899, // remaining = 101 → fits 50 (insert) + 50 (floor)
+    });
+    const plan = await engine.planRun(pairId);
+    const step = await engine.stepRun(plan.runId);
+    expect(step.status).toBe("done");
   });
 });

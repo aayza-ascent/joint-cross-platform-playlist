@@ -181,6 +181,18 @@ export class SpotifyClient {
         // Token may have rotated since we read it; re-fetch and retry once.
         continue;
       }
+      // Transient 5xx → retry with exponential backoff. Spotify's edge can
+      // return 502/503 sporadically; without retry, a single bad response
+      // surfaces as an item-level failure for the user instead of being
+      // absorbed transparently.
+      if (
+        res.status >= 500 &&
+        res.status < 600 &&
+        attempt < MAX_RETRIES - 1
+      ) {
+        await sleep(500 * 2 ** attempt + Math.floor(Math.random() * 200));
+        continue;
+      }
       if (!res.ok) {
         const text = await safeText(res);
         throw new SpotifyApiError(res.status, text);
