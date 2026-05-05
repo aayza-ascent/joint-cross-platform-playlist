@@ -33,10 +33,15 @@ export class SpotifyClient {
         // be read via /playlists/{id}/tracks for apps in Development Mode —
         // they 403 there. Filter them out so users can't pick one.
         if (p.owner?.id === "spotify") continue;
+        // Spotify renamed the field on playlist summary objects from `tracks`
+        // to `items` (same retirement that hit the /tracks endpoint). Old
+        // clients see 0 for every playlist; read both to stay compatible.
+        const trackCount =
+          p.items?.total ?? p.tracks?.total ?? 0;
         out.push({
           id: p.id,
           name: p.name ?? "(untitled)",
-          trackCount: p.tracks?.total ?? 0,
+          trackCount,
         });
       }
       url = json.next ?? null;
@@ -116,7 +121,10 @@ export class SpotifyClient {
         this.limit(() =>
           this.request(
             "POST",
-            `${SPOTIFY_API}/playlists/${encodeURIComponent(playlistId)}/tracks`,
+            // /items is the canonical write endpoint per Spotify's current
+            // docs. The legacy /tracks endpoint 403s for apps in Development
+            // Mode (same retirement that bit reads — see commit 9629672).
+            `${SPOTIFY_API}/playlists/${encodeURIComponent(playlistId)}/items`,
             { uris: batch },
           ),
         ),
@@ -137,7 +145,8 @@ export class SpotifyClient {
         this.limit(() =>
           this.request(
             "DELETE",
-            `${SPOTIFY_API}/playlists/${encodeURIComponent(playlistId)}/tracks`,
+            // See addTracks — /tracks is retired for Dev Mode apps; use /items.
+            `${SPOTIFY_API}/playlists/${encodeURIComponent(playlistId)}/items`,
             { tracks: batch },
           ),
         ),
@@ -210,6 +219,7 @@ type PagedPlaylists = {
   items: Array<{
     id?: string;
     name?: string;
+    items?: { total?: number };
     tracks?: { total?: number };
     owner?: { id?: string };
   } | null>;

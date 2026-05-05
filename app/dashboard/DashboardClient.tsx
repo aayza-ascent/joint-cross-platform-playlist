@@ -213,7 +213,12 @@ export default function DashboardClient(props: {
     isFirstSync: boolean,
     totalPlanned: number,
   ) {
-    while (true) {
+    // Hard cap: ~5 minutes of polling at 1.5s/iteration. A run that hasn't
+    // settled by then has either silently failed or is stuck on the server
+    // — surface that explicitly instead of looping forever.
+    const MAX_ITERATIONS = 200;
+    const POLL_DELAY_MS = 1500;
+    for (let i = 0; i < MAX_ITERATIONS; i++) {
       const stepRes = await fetch(
         `/api/sync/${pairId}/step?runId=${encodeURIComponent(runId)}`,
         { method: "POST" },
@@ -257,7 +262,29 @@ export default function DashboardClient(props: {
       }));
 
       if (step.status !== "running") return;
+      await sleep(POLL_DELAY_MS);
     }
+    setSyncByPair((s) => ({
+      ...s,
+      [pairId]: {
+        ...(s[pairId] ?? {
+          runId,
+          status: "failed",
+          addedYt: 0,
+          addedSp: 0,
+          removedYt: 0,
+          removedSp: 0,
+          failed: 0,
+          remaining: 0,
+          totalPlanned,
+          isFirstSync,
+          quotaRemainingToday: 0,
+        }),
+        status: "failed",
+        errorDetail:
+          "Sync ran longer than expected and is still in progress. Check back in a minute and press Sync now to resume.",
+      },
+    }));
   }
 
   return (
@@ -605,20 +632,28 @@ function PairsList(props: {
                     <span className="basis-full text-rose-300">
                       {prog.failures
                         .slice(0, 3)
-                        .map(
-                          (f) => `${f.action}: ${f.error ?? "unknown"}`,
-                        )
+                        .map((f) => translateItemFailure(f.action, f.error))
                         .join(" · ")}
+                      {prog.failures.length > 3 &&
+                        ` · +${prog.failures.length - 3} more`}
                     </span>
                   )}
                   {prog.status === "paused_quota" && (
                     <span className="ml-auto text-amber-300">
                       Paused — YouTube quota resets at 00:00 Pacific. Remaining
-                      today: {prog.quotaRemainingToday}.
+                      today: {prog.quotaRemainingToday}. Press Sync now after
+                      reset to resume.
                     </span>
                   )}
-                  {prog.status === "done" && (
-                    <span className="ml-auto text-emerald-300">Done.</span>
+                  {prog.status === "done" && prog.failed === 0 && (
+                    <span className="ml-auto text-emerald-300">
+                      Done — both sides in sync.
+                    </span>
+                  )}
+                  {prog.status === "done" && prog.failed > 0 && (
+                    <span className="ml-auto text-amber-300">
+                      Done with {prog.failed} unsynced — see failures above.
+                    </span>
                   )}
                   {prog.status === "failed" && (
                     <span className="ml-auto text-rose-300 truncate">
@@ -661,7 +696,52 @@ async function handleApi<T>(res: Response): Promise<T> {
 }
 
 function formatError(err: unknown): string {
-  return err instanceof Error ? err.message : "unknown error";
+  const raw = err instanceof Error ? err.message : "unknown error";
+  return translateError(raw);
+}
+
+// Map known server-error patterns to actionable user-facing copy. The status
+// code + JSON body is preserved for the "untranslated" tail so debugging
+// info isn't lost.
+function translateError(raw: string): string {
+  if (/spotify_forbidden|spotify 403/i.test(raw)) {
+    return "Spotify is refusing the write. Disconnect Spotify and reconnect to mint a fresh token; if that doesn't fix it, hit /api/debug/spotify-write to see why.";
+  }
+  if (/not_connected/i.test(raw)) {
+    return "Provider isn't connected. Connect it in the Provider connections card.";
+  }
+  if (/broken_pair/i.test(raw)) {
+    return "This pair is broken — one of the playlists no longer exists. Delete and recreate the pair.";
+  }
+  if (/quota_exceeded|paused_quota/i.test(raw)) {
+    return "YouTube daily quota hit. Resumes after midnight Pacific.";
+  }
+  if (/rate_limited|429/.test(raw)) {
+    return "Hitting provider rate limits. Wait a minute and try again.";
+  }
+  return raw;
+}
+
+function translateItemFailure(action: string, error: string | null): string {
+  const a = action.replace(/_/g, " ");
+  if (!error) return `${a}: failed`;
+  if (/no_results/i.test(error)) {
+    return `${a}: no match found on the other side`;
+  }
+  if (/low_confidence/i.test(error)) {
+    return `${a}: candidates too uncertain to auto-match`;
+  }
+  if (/spotify 403/i.test(error)) {
+    return `${a}: Spotify refused the write (reconnect Spotify)`;
+  }
+  if (/missing_playlist_item_id|missing_youtube_video_id|missing_spotify_track_id/i.test(error)) {
+    return `${a}: missing reference (try syncing again)`;
+  }
+  return `${a}: ${error.slice(0, 120)}`;
+}
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 function mapBy<T, K>(arr: T[], keyFn: (t: T) => K): Map<K, T> {

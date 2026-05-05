@@ -19,9 +19,17 @@ const STEP_WALL_BUDGET_MS = 8_000;
 const QUOTA_GUARD_FOR_SEARCH = 100; // a single search.list call
 
 export class ActiveRunExistsError extends Error {
-  constructor() {
+  constructor(public runId: string) {
     super(
       "another sync is already in progress for this pair; finish or cancel it first",
+    );
+  }
+}
+
+export class BrokenPairError extends Error {
+  constructor() {
+    super(
+      "this pair is marked broken — one of the playlists no longer exists or the user lost access. delete and recreate the pair.",
     );
   }
 }
@@ -36,6 +44,7 @@ export type PlanResult = {
   plannedSkips: number;
   plannedQuotaUnits: number;
   isFirstSync: boolean;
+  resumed: boolean;
 };
 
 export type StepStatus = "running" | "done" | "failed" | "paused_quota";
@@ -60,6 +69,10 @@ export type EngineDeps = {
 export class SyncEngine {
   private now: () => Date;
   private itemsPerStep: number;
+  // Per-instance cache: avoids re-fetching the Spotify playlist for every
+  // unmapped item in a step. Each /api/sync/[pairId]/step request creates
+  // a fresh engine, so this lives only for one step (~5 items at most).
+  private stepSpTracksCache = new Map<string, Promise<NormalizedTrack[]>>();
 
   constructor(private deps: EngineDeps) {
     this.now = deps.now ?? (() => new Date());
@@ -70,9 +83,27 @@ export class SyncEngine {
     const { store, spotify, youtube, userId } = this.deps;
     const pair = await store.getPair(pairId, userId);
     if (!pair) throw new Error(`pair ${pairId} not found for user`);
+    if (pair.broken) throw new BrokenPairError();
 
-    if (await store.hasActiveRun(pairId, userId)) {
-      throw new ActiveRunExistsError();
+    // If there's already an active or paused run, return it so the caller
+    // can keep polling /step. The previous behavior (throw) left the user
+    // stranded after a `paused_quota` because there's no separate Resume
+    // button — pressing Sync Now is the universal "make progress" action.
+    const existing = await store.findActiveRun(pairId, userId);
+    if (existing) {
+      const counts = await store.countItems(existing.runId);
+      return {
+        runId: existing.runId,
+        totalItems: counts.total,
+        plannedAddYt: 0,
+        plannedAddSp: 0,
+        plannedRemoveYt: 0,
+        plannedRemoveSp: 0,
+        plannedSkips: 0,
+        plannedQuotaUnits: 0,
+        isFirstSync: false,
+        resumed: true,
+      };
     }
 
     const [baseline, spTracks, ytItems] = await Promise.all([
@@ -312,6 +343,7 @@ export class SyncEngine {
       plannedSkips,
       plannedQuotaUnits,
       isFirstSync,
+      resumed: false,
     };
   }
 
@@ -523,20 +555,40 @@ export class SyncEngine {
     const { store, spotify, youtube, userId } = this.deps;
     const pair = await store.getPair(pairId, userId);
     if (!pair) return;
-    // Re-snapshot AFTER all step writes so the baseline reflects the end-state.
-    const [spTracks, ytItems] = await Promise.all([
-      spotify.getPlaylistTracks(pair.spotifyPlaylistId),
-      youtube.getPlaylistItems(pair.youtubePlaylistId),
-    ]);
-    const baseline: PairBaseline = {
-      spotifyTrackIds: spTracks.map((t) => t.sourceTrackId),
-      youtubeItems: ytItems.map((i) => ({
-        videoId: i.videoId,
-        playlistItemId: i.playlistItemId,
-      })),
-      syncedAt: this.now(),
-    };
-    await store.commitRunDoneAndBaseline(runId, pairId, baseline);
+
+    // Re-snapshot AFTER all step writes so the baseline reflects end-state.
+    // If either provider read fails (transient 5xx, network blip), we still
+    // need to flip the run to `done` — leaving it `running` strands the user
+    // forever. Worst-case fallback: mark done WITHOUT a baseline; the next
+    // sync treats this pair as a first-sync union (a duplicate-add risk, but
+    // recoverable) rather than freezing the UI.
+    let baseline: PairBaseline | null = null;
+    try {
+      const [spTracks, ytItems] = await Promise.all([
+        spotify.getPlaylistTracks(pair.spotifyPlaylistId),
+        youtube.getPlaylistItems(pair.youtubePlaylistId),
+      ]);
+      baseline = {
+        spotifyTrackIds: spTracks.map((t) => t.sourceTrackId),
+        youtubeItems: ytItems.map((i) => ({
+          videoId: i.videoId,
+          playlistItemId: i.playlistItemId,
+        })),
+        syncedAt: this.now(),
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message.slice(0, 200) : "unknown";
+      await store.updateSyncRun(runId, {
+        error: `baseline_read_failed: ${msg}`,
+      });
+    }
+
+    if (baseline) {
+      await store.commitRunDoneAndBaseline(runId, pairId, baseline);
+    } else {
+      // No baseline written; just flip the run done so the UI unsticks.
+      await store.updateSyncRun(runId, { status: "done" });
+    }
   }
 
   private async handleAddToYt(
@@ -711,7 +763,16 @@ export class SyncEngine {
     playlistId: string,
     trackId: string,
   ): Promise<NormalizedTrack | null> {
-    const all = await this.deps.spotify.getPlaylistTracks(playlistId);
+    // Cache the full playlist read for the lifetime of the engine instance
+    // (one /step invocation). Without this, processing 5 unmapped items in a
+    // single step does 5 full playlist reads — slow enough to blow the 8s
+    // wall budget and trigger spurious Spotify rate-limits.
+    let pending = this.stepSpTracksCache.get(playlistId);
+    if (!pending) {
+      pending = this.deps.spotify.getPlaylistTracks(playlistId);
+      this.stepSpTracksCache.set(playlistId, pending);
+    }
+    const all = await pending;
     return all.find((t) => t.sourceTrackId === trackId) ?? null;
   }
 

@@ -132,11 +132,12 @@ export async function POST() {
       return NextResponse.json(out);
     }
 
-    // 2. Probe: add a known-public track to the new playlist
-    // Using a stable, well-known popular track (Beyoncé - Halo).
+    // 2. Probe: add a known-public track to the new playlist via the canonical
+    // /items endpoint. (The legacy /tracks endpoint 403s in Dev Mode — see
+    // lib/spotify/client.ts addTracks.)
     out.addTrackAttempt = await rawCall(
       "POST",
-      `https://api.spotify.com/v1/playlists/${encodeURIComponent(newPlaylistId)}/tracks`,
+      `https://api.spotify.com/v1/playlists/${encodeURIComponent(newPlaylistId)}/items`,
       token,
       { uris: ["spotify:track:4JehYebiI9JE8sR8MisGVb"] },
     );

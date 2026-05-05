@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ActiveRunExistsError, SyncEngine } from "./engine";
+import { BrokenPairError, SyncEngine } from "./engine";
 import { InMemorySyncStore } from "./store";
 import type {
   SpotifyClient,
@@ -206,6 +206,7 @@ function makeEngine(args: {
     userId,
     spotifyPlaylistId: spId,
     youtubePlaylistId: ytId,
+    broken: false,
   });
   if (args.baseline) {
     store.baselines.set(pairId, {
@@ -439,17 +440,30 @@ describe("planRun: subsequent sync with baseline", () => {
 });
 
 describe("planRun guards", () => {
-  it("refuses to start when an active run already exists for the pair", async () => {
+  it("returns the existing run as resumed when an active run is in flight", async () => {
     const { engine, pairId, store, userId } = makeEngine({ spTracks: [] });
-    await store.createSyncRun({ pairId, userId, mode: "two_way" });
-    await expect(engine.planRun(pairId)).rejects.toBeInstanceOf(
-      ActiveRunExistsError,
-    );
+    const existingRunId = await store.createSyncRun({
+      pairId,
+      userId,
+      mode: "two_way",
+    });
+    const plan = await engine.planRun(pairId);
+    expect(plan.runId).toBe(existingRunId);
+    expect(plan.resumed).toBe(true);
   });
 
   it("rejects unknown pair", async () => {
     const { engine } = makeEngine({ spTracks: [] });
     await expect(engine.planRun("nope")).rejects.toThrow(/not found/);
+  });
+
+  it("throws BrokenPairError when pair.broken is true", async () => {
+    const { engine, pairId, store } = makeEngine({ spTracks: [] });
+    const p = store.pairs.get(pairId);
+    if (p) p.broken = true;
+    await expect(engine.planRun(pairId)).rejects.toBeInstanceOf(
+      BrokenPairError,
+    );
   });
 });
 

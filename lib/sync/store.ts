@@ -35,6 +35,7 @@ export type PairRef = {
   userId: string;
   spotifyPlaylistId: string;
   youtubePlaylistId: string;
+  broken: boolean;
 };
 
 export type YoutubeBaselineItem = { videoId: string; playlistItemId: string };
@@ -91,6 +92,15 @@ export interface SyncStore {
   // see a baseline that doesn't reflect the in-flight run's effects.
   hasActiveRun(pairId: string, userId: string): Promise<boolean>;
 
+  // Returns the active run id + status if one exists, else null. Used so
+  // pressing Sync Now while a run is paused/in-flight resumes that run
+  // instead of throwing — the user shouldn't have to know to call /step
+  // directly.
+  findActiveRun(
+    pairId: string,
+    userId: string,
+  ): Promise<{ runId: string; status: SyncRunStatus } | null>;
+
   getMappingsByTrackIds(
     userId: string,
     trackIds: string[],
@@ -118,6 +128,13 @@ export interface SyncStore {
   getSyncRun(runId: string): Promise<SyncRunRow | null>;
 
   getPendingItems(runId: string, limit: number): Promise<SyncItemRow[]>;
+
+  // Aggregate counts for a run — used so the UI can show progress when
+  // resuming an existing in-flight run (we don't have the original plan
+  // result anymore at that point).
+  countItems(
+    runId: string,
+  ): Promise<{ total: number; pending: number; done: number; failed: number }>;
 
   updateSyncRunItem(
     itemId: string,
@@ -186,6 +203,7 @@ export class DrizzleSyncStore implements SyncStore {
       userId: row.userId,
       spotifyPlaylistId: row.spotifyPlaylistId,
       youtubePlaylistId: row.youtubePlaylistId,
+      broken: row.broken,
     };
   }
 
@@ -205,8 +223,15 @@ export class DrizzleSyncStore implements SyncStore {
   }
 
   async hasActiveRun(pairId: string, userId: string): Promise<boolean> {
-    const row = await this.db
-      .select({ id: syncRuns.id })
+    return (await this.findActiveRun(pairId, userId)) !== null;
+  }
+
+  async findActiveRun(
+    pairId: string,
+    userId: string,
+  ): Promise<{ runId: string; status: SyncRunStatus } | null> {
+    const rows = await this.db
+      .select({ id: syncRuns.id, status: syncRuns.status })
       .from(syncRuns)
       .where(
         and(
@@ -216,7 +241,8 @@ export class DrizzleSyncStore implements SyncStore {
         ),
       )
       .limit(1);
-    return row.length > 0;
+    if (rows.length === 0) return null;
+    return { runId: rows[0].id, status: rows[0].status as SyncRunStatus };
   }
 
   async getMappingsByTrackIds(
@@ -367,6 +393,21 @@ export class DrizzleSyncStore implements SyncStore {
       youtubePlaylistItemId: r.youtubePlaylistItemId,
       error: r.error,
     }));
+  }
+
+  async countItems(runId: string) {
+    const rows = await this.db
+      .select({ status: syncRunItems.status })
+      .from(syncRunItems)
+      .where(eq(syncRunItems.runId, runId));
+    const c = { total: 0, pending: 0, done: 0, failed: 0 };
+    for (const r of rows) {
+      c.total++;
+      if (r.status === "pending") c.pending++;
+      else if (r.status === "done") c.done++;
+      else if (r.status === "failed") c.failed++;
+    }
+    return c;
   }
 
   async updateSyncRunItem(
@@ -531,6 +572,10 @@ export class InMemorySyncStore implements SyncStore {
   }
 
   async hasActiveRun(pairId: string, userId: string) {
+    return (await this.findActiveRun(pairId, userId)) !== null;
+  }
+
+  async findActiveRun(pairId: string, userId: string) {
     for (const r of this.runs.values()) {
       if (
         r.pairId === pairId &&
@@ -539,10 +584,10 @@ export class InMemorySyncStore implements SyncStore {
           r.status === "running" ||
           r.status === "paused_quota")
       ) {
-        return true;
+        return { runId: r.id, status: r.status };
       }
     }
-    return false;
+    return null;
   }
 
   async getMappingsByTrackIds(userId: string, trackIds: string[]) {
@@ -621,6 +666,17 @@ export class InMemorySyncStore implements SyncStore {
     return (this.items.get(runId) ?? [])
       .filter((it) => it.status === "pending")
       .slice(0, limit);
+  }
+
+  async countItems(runId: string) {
+    const arr = this.items.get(runId) ?? [];
+    const c = { total: arr.length, pending: 0, done: 0, failed: 0 };
+    for (const it of arr) {
+      if (it.status === "pending") c.pending++;
+      else if (it.status === "done") c.done++;
+      else if (it.status === "failed") c.failed++;
+    }
+    return c;
   }
 
   async updateSyncRunItem(

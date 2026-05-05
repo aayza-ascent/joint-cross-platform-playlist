@@ -217,7 +217,7 @@ describe("SpotifyClient", () => {
     );
   });
 
-  it("addTracks chunks at 100 URIs per call", async () => {
+  it("addTracks chunks at 100 URIs per call and hits /items", async () => {
     const { fn, calls } = mockFetch([
       { status: 201, body: { snapshot_id: "s1" } },
       { status: 201, body: { snapshot_id: "s2" } },
@@ -227,6 +227,10 @@ describe("SpotifyClient", () => {
     const uris = Array.from({ length: 250 }, (_, i) => `spotify:track:t${i}`);
     await c.addTracks("p", uris);
     expect(fn).toHaveBeenCalledTimes(3);
+    for (const call of calls) {
+      expect(call.url).toContain("/playlists/p/items");
+      expect(call.url).not.toContain("/playlists/p/tracks");
+    }
     const bodies = calls.map((c) => JSON.parse(c.init?.body as string).uris);
     expect(bodies[0]).toHaveLength(100);
     expect(bodies[1]).toHaveLength(100);
