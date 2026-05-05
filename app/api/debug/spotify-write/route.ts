@@ -1,4 +1,7 @@
 import { NextResponse } from "next/server";
+import { and, eq } from "drizzle-orm";
+import { db } from "@/db/client";
+import { connectedAccounts } from "@/db/schema";
 import { withSession } from "@/lib/auth/session";
 import { getValidAccessToken } from "@/lib/auth/tokens";
 
@@ -20,12 +23,23 @@ import { getValidAccessToken } from "@/lib/auth/tokens";
 //   - the playlist is private and named for easy manual cleanup
 export async function GET() {
   return withSession(async ({ userId }) => {
+    const row = await db.query.connectedAccounts.findFirst({
+      where: and(
+        eq(connectedAccounts.userId, userId),
+        eq(connectedAccounts.provider, "spotify"),
+      ),
+    });
+
     let token: string;
     try {
       token = await getValidAccessToken(userId, "spotify");
     } catch (err) {
       return NextResponse.json(
-        { error: "no_spotify_token", detail: errMsg(err) },
+        {
+          error: "no_spotify_token",
+          detail: errMsg(err),
+          grantedScopeOnStoredToken: row?.scope ?? null,
+        },
         { status: 200 },
       );
     }
@@ -48,8 +62,11 @@ export async function GET() {
         spotifyProduct: meBody?.product ?? null,
         country: meBody?.country ?? null,
         userManagementMustMatchThisEmail: meBody?.email ?? null,
+        grantedScopeOnStoredToken: row?.scope ?? null,
+        tokenIssuedAt: row?.createdAt ?? null,
+        tokenLastRefreshedAt: row?.updatedAt ?? null,
         howToCheck:
-          "Open https://developer.spotify.com/dashboard → your app → Settings → User Management. The email row there must equal `spotifyEmailOnAccount` above. If they differ, either change User Management or sign in to Spotify with the account whose email matches.",
+          "Two things must be true: (a) `grantedScopeOnStoredToken` contains `playlist-modify-public` AND `playlist-modify-private` — if either is missing, disconnect Spotify in this app and reconnect to mint a fresh token. (b) `spotifyEmailOnAccount` matches the email in https://developer.spotify.com/dashboard → your app → Settings → User Management exactly.",
       },
     });
   });
@@ -57,12 +74,23 @@ export async function GET() {
 
 export async function POST() {
   return withSession(async ({ userId }) => {
+    const row = await db.query.connectedAccounts.findFirst({
+      where: and(
+        eq(connectedAccounts.userId, userId),
+        eq(connectedAccounts.provider, "spotify"),
+      ),
+    });
+
     let token: string;
     try {
       token = await getValidAccessToken(userId, "spotify");
     } catch (err) {
       return NextResponse.json(
-        { error: "no_spotify_token", detail: errMsg(err) },
+        {
+          error: "no_spotify_token",
+          detail: errMsg(err),
+          grantedScopeOnStoredToken: row?.scope ?? null,
+        },
         { status: 200 },
       );
     }
@@ -78,12 +106,14 @@ export async function POST() {
     out.summary = {
       spotifyUserId: myId,
       spotifyEmailOnAccount: meBody?.email ?? null,
+      grantedScopeOnStoredToken: row?.scope ?? null,
     };
 
-    // 1. Probe: create
+    // 1. Probe: create against /me/playlists (the canonical endpoint and the
+    // one lib/spotify/client.ts uses).
     const create = await rawCall(
       "POST",
-      `https://api.spotify.com/v1/users/${encodeURIComponent(myId)}/playlists`,
+      "https://api.spotify.com/v1/me/playlists",
       token,
       { name: "diagnostic-DELETE-ME", public: false, description: "test" },
     );

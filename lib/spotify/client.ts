@@ -91,19 +91,13 @@ export class SpotifyClient {
       }));
   }
 
-  async getCurrentUserId(): Promise<string> {
-    const me: { id: string } = await this.request("GET", `${SPOTIFY_API}/me`);
-    return me.id;
-  }
-
   async createPlaylist(
     name: string,
     opts: { description?: string; isPublic?: boolean } = {},
   ): Promise<string> {
-    const userId = await this.getCurrentUserId();
     const json: { id: string } = await this.request(
       "POST",
-      `${SPOTIFY_API}/users/${encodeURIComponent(userId)}/playlists`,
+      `${SPOTIFY_API}/me/playlists`,
       {
         name,
         public: opts.isPublic ?? false,

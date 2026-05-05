@@ -47,7 +47,10 @@ export async function GET() {
     const url = new URL("https://accounts.spotify.com/authorize");
     url.searchParams.set("client_id", clientId);
     url.searchParams.set("response_type", "code");
-    url.searchParams.set("redirect_uri", appUrl("/api/connect/spotify/callback"));
+    url.searchParams.set(
+      "redirect_uri",
+      appUrl("/api/connect/spotify/callback"),
+    );
     url.searchParams.set("scope", SCOPES.join(" "));
     url.searchParams.set("state", state);
     url.searchParams.set("code_challenge_method", "S256");

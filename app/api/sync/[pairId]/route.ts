@@ -41,7 +41,7 @@ export async function POST(
           {
             error: "spotify_forbidden",
             detail:
-              "Spotify returned 403 Forbidden. Apps in Development Mode can only act on data of users explicitly listed in the app's User Management section — including the developer. Open https://developer.spotify.com/dashboard → your app → Settings → User Management → Add new user. Use the email of your Spotify account (NOT your Google sign-in email — they may differ; check https://www.spotify.com/account/profile/). After saving, retry — no reconnect needed.",
+              "Spotify returned 403 Forbidden. In Development Mode, an app can only act on data of users explicitly listed in the dashboard's User Management section. Two checks: (1) Open /api/debug/spotify-write (GET) and confirm `spotifyEmailOnAccount` matches the email row at https://developer.spotify.com/dashboard → your app → Settings → User Management exactly (case, whitespace, plus-aliases, dots all matter). The Spotify account email may differ from the Google sign-in email — see https://www.spotify.com/account/profile/. (2) Even if the email is correct, a token issued before the User Management entry was added will keep 403'ing — disconnect Spotify in this app and reconnect to mint a fresh token. Then retry.",
             spotifyBody: err.body.slice(0, 500),
           },
           { status: 422 },
