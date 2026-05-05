@@ -15,6 +15,24 @@ type PairRow = {
 type SpPlaylist = { id: string; name: string; trackCount: number };
 type YtPlaylist = { id: string; title: string; itemCount: number };
 
+type FailureCandidate = {
+  videoId: string;
+  title: string;
+  channelTitle: string;
+  durationMs: number;
+  score: number;
+};
+
+type Failure = {
+  action: string;
+  error: string | null;
+  spotifyTrackId: string | null;
+  youtubeVideoId: string | null;
+  spotifyTitle: string | null;
+  spotifyArtists: string[] | null;
+  candidates: FailureCandidate[] | null;
+};
+
 type SyncProgress = {
   runId: string;
   status: "running" | "done" | "failed" | "paused_quota";
@@ -28,7 +46,7 @@ type SyncProgress = {
   isFirstSync: boolean;
   quotaRemainingToday: number;
   errorDetail?: string;
-  failures?: Array<{ action: string; error: string | null }>;
+  failures?: Failure[];
 };
 
 export default function DashboardClient(props: {
@@ -240,7 +258,7 @@ export default function DashboardClient(props: {
           removedSp: number;
           failed: number;
         };
-        failures?: Array<{ action: string; error: string | null }>;
+        failures?: Failure[];
       }>(runRes);
 
       setSyncByPair((s) => ({
@@ -629,14 +647,7 @@ function PairsList(props: {
                   <span className="text-rose-400">! {prog.failed} failed</span>
                   <span>{prog.remaining} remaining</span>
                   {prog.failures && prog.failures.length > 0 && (
-                    <span className="basis-full text-rose-300">
-                      {prog.failures
-                        .slice(0, 3)
-                        .map((f) => translateItemFailure(f.action, f.error))
-                        .join(" · ")}
-                      {prog.failures.length > 3 &&
-                        ` · +${prog.failures.length - 3} more`}
-                    </span>
+                    <FailureList failures={prog.failures} />
                   )}
                   {prog.status === "paused_quota" && (
                     <span className="ml-auto text-amber-300">
@@ -667,6 +678,87 @@ function PairsList(props: {
         );
       })}
     </section>
+  );
+}
+
+// ---- failure rendering ----
+
+function FailureList({ failures }: { failures: Failure[] }) {
+  // Cap the visible list so a 50-item failure batch doesn't blow up the card.
+  // Users can act on the first dozen and re-sync; recurrent failures will keep
+  // surfacing until manually resolved or the matcher cache catches them.
+  const VISIBLE = 12;
+  const visible = failures.slice(0, VISIBLE);
+  const hidden = failures.length - visible.length;
+  return (
+    <div className="basis-full mt-1 space-y-1.5">
+      {visible.map((f, i) => (
+        <FailureRow key={i} failure={f} />
+      ))}
+      {hidden > 0 && (
+        <div className="text-rose-300 text-xs">
+          +{hidden} more failed track{hidden === 1 ? "" : "s"} not shown.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FailureRow({ failure: f }: { failure: Failure }) {
+  const reason = translateItemFailure(f.action, f.error);
+  const trackLabel =
+    f.spotifyTitle && f.spotifyArtists?.length
+      ? `${f.spotifyTitle} — ${f.spotifyArtists.join(", ")}`
+      : f.spotifyTitle ?? f.spotifyTrackId ?? f.youtubeVideoId ?? null;
+
+  return (
+    <div className="text-xs">
+      <div className="text-rose-300">
+        {trackLabel ? (
+          <>
+            <span className="font-medium">{trackLabel}</span>
+            {f.spotifyTrackId && (
+              <>
+                {" "}
+                <a
+                  href={`https://open.spotify.com/track/${f.spotifyTrackId}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-neutral-500 hover:text-neutral-300 underline-offset-2 hover:underline"
+                >
+                  open
+                </a>
+              </>
+            )}
+            <span className="text-neutral-500"> — {reason}</span>
+          </>
+        ) : (
+          reason
+        )}
+      </div>
+      {f.candidates && f.candidates.length > 0 && (
+        <div className="pl-3 mt-0.5 text-neutral-500">
+          Closest matches:
+          <ul className="list-none mt-0.5 space-y-0.5">
+            {f.candidates.map((c) => (
+              <li key={c.videoId}>
+                <a
+                  href={`https://www.youtube.com/watch?v=${c.videoId}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-sky-400 hover:text-sky-300 underline-offset-2 hover:underline"
+                >
+                  {c.title}
+                </a>{" "}
+                <span className="text-neutral-600">
+                  · {c.channelTitle} · score {c.score.toFixed(2)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
   );
 }
 

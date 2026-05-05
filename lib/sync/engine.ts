@@ -14,9 +14,30 @@ import {
   type SyncStore,
 } from "./store";
 
-const STEP_ITEMS_DEFAULT = 5;
+// Bumped from 5 → 8 once the per-step Spotify track cache landed: a step
+// that previously did N full SP playlist reads now does at most one. The 8s
+// wall budget has the headroom; if a step ever exceeds it the remaining
+// items just stay `pending` and resume on the next /step call.
+const STEP_ITEMS_DEFAULT = 8;
 const STEP_WALL_BUDGET_MS = 8_000;
-const QUOTA_GUARD_FOR_SEARCH = 100; // a single search.list call
+// Hard floor on quota left in the day. Below this we refuse to start the
+// step at all, keeping a small buffer for concurrent paths (e.g. mirror
+// playlist creation costs 50 units).
+const QUOTA_HARD_FLOOR = 50;
+// Retry search costs another 100 + ~1 quota units. Only run it when we have
+// enough headroom to also do the eventual insert (50 units) without tipping
+// into paused_quota mid-flight.
+const RETRY_SEARCH_QUOTA_FLOOR = 250;
+
+// Per-action YouTube cost estimate for the pre-flight quota guard. add_to_yt
+// without a known videoId will additionally cost ~101 (search + videos.list)
+// at handle-time; we treat that case as worst-case so the guard doesn't
+// admit a step that runs out of budget mid-flight.
+function estimateYtCost(action: string, hasResolvedVideoId: boolean): number {
+  if (action === "remove_from_yt") return 50;
+  if (action === "add_to_yt") return hasResolvedVideoId ? 50 : 101 + 50;
+  return 0;
+}
 
 export class ActiveRunExistsError extends Error {
   constructor(public runId: string) {
@@ -596,7 +617,7 @@ export class SyncEngine {
     pair: { spotifyPlaylistId: string; youtubePlaylistId: string },
     alreadyInserted: Set<string>,
   ): Promise<{ videoId: string } | null> {
-    const { store, spotify, youtube, userId } = this.deps;
+    const { store, youtube, userId } = this.deps;
     let videoId = item.youtubeVideoId;
     let confidence = 1;
     let matchMethod: "manual" | "isrc" | "fuzzy_high" | "fuzzy_low" = "manual";
@@ -613,58 +634,85 @@ export class SyncEngine {
         });
         return null;
       }
-      const query = `${spTrack.title} ${spTrack.artists.join(" ")}`.slice(
-        0,
-        200,
-      );
-      const hits = await youtube.searchVideos(query, 5);
-      if (hits.length === 0) {
+      // Try the standard query first. If nothing scores ≥ 0.75, retry once
+      // with an alternate phrasing that biases toward official channels —
+      // most low-confidence misses come from the first search returning fan
+      // uploads, lyric channels, or covers as the top hits.
+      const primaryQuery = `${spTrack.title} ${spTrack.artists.join(" ")}`;
+      const altQuery = `${spTrack.artists[0] ?? ""} ${spTrack.title} official audio`.trim();
+      const queries = [primaryQuery];
+      if (altQuery && altQuery !== primaryQuery) queries.push(altQuery);
+
+      let matchedResult: NonNullable<
+        ReturnType<typeof matchSpotifyToYouTube>["result"]
+      > | null = null;
+      let bestCandidates: NormalizedTrack[] = [];
+      let bestTopN: ReturnType<typeof matchSpotifyToYouTube>["topN"] = [];
+      let sawAnyResults = false;
+
+      for (let i = 0; i < queries.length; i++) {
+        if (i > 0) {
+          // Gate the retry behind enough quota to still complete the insert.
+          const remaining = await this.deps.quota.remaining();
+          if (remaining < RETRY_SEARCH_QUOTA_FLOOR) break;
+        }
+        const q = queries[i].slice(0, 200);
+        const hits = await youtube.searchVideos(q, 5);
+        if (hits.length === 0) continue;
+        sawAnyResults = true;
+        const detail = await youtube.getVideosByIds(hits.map((h) => h.videoId));
+        const candidates: NormalizedTrack[] = hits.map((h) => {
+          const d = detail.get(h.videoId);
+          return {
+            source: "youtube",
+            sourceTrackId: h.videoId,
+            title: h.title,
+            artists: [h.channelTitle].filter(Boolean),
+            durationMs: d?.durationMs ?? 0,
+          };
+        });
+        const m = matchSpotifyToYouTube(spTrack, candidates);
+        // Keep the strongest candidate set across attempts so the unmatched
+        // record shows the best top-3 we ever saw, not whichever came last.
+        if (
+          bestTopN.length === 0 ||
+          (m.best?.score ?? 0) > (bestTopN[0]?.score ?? 0)
+        ) {
+          bestCandidates = candidates;
+          bestTopN = m.topN;
+        }
+        if (m.result) {
+          matchedResult = m.result;
+          break;
+        }
+      }
+
+      if (!matchedResult) {
         await store.upsertUnmatched({
           userId,
           spotifyTrackId: item.spotifyTrackId!,
-          candidates: [],
+          candidates: {
+            spotifyTitle: spTrack.title,
+            spotifyArtists: spTrack.artists,
+            candidates: bestCandidates.slice(0, 3).map((c, i) => ({
+              videoId: c.sourceTrackId,
+              title: c.title,
+              channelTitle: c.artists[0] ?? "",
+              durationMs: c.durationMs,
+              score: bestTopN[i]?.score ?? 0,
+            })),
+          },
           runId: item.runId,
         });
         await store.updateSyncRunItem(item.id, {
           status: "failed",
-          error: "no_results",
+          error: sawAnyResults ? "low_confidence" : "no_results",
         });
         return null;
       }
-      const detail = await youtube.getVideosByIds(hits.map((h) => h.videoId));
-      const candidates: NormalizedTrack[] = hits.map((h) => {
-        const d = detail.get(h.videoId);
-        return {
-          source: "youtube",
-          sourceTrackId: h.videoId,
-          title: h.title,
-          artists: [h.channelTitle].filter(Boolean),
-          durationMs: d?.durationMs ?? 0,
-        };
-      });
-      const matched = matchSpotifyToYouTube(spTrack, candidates);
-      if (!matched.result) {
-        await store.upsertUnmatched({
-          userId,
-          spotifyTrackId: item.spotifyTrackId!,
-          candidates: candidates.slice(0, 3).map((c, i) => ({
-            videoId: c.sourceTrackId,
-            title: c.title,
-            channelTitle: c.artists[0] ?? "",
-            durationMs: c.durationMs,
-            score: matched.topN[i]?.score ?? 0,
-          })),
-          runId: item.runId,
-        });
-        await store.updateSyncRunItem(item.id, {
-          status: "failed",
-          error: "low_confidence",
-        });
-        return null;
-      }
-      videoId = matched.result.videoId;
-      confidence = matched.result.confidence;
-      matchMethod = matched.result.method;
+      videoId = matchedResult.videoId;
+      confidence = matchedResult.confidence;
+      matchMethod = matchedResult.method;
       await store.upsertMapping({
         userId,
         spotifyTrackId: item.spotifyTrackId!,

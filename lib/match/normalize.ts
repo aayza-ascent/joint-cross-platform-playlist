@@ -59,7 +59,12 @@ export function normalizeTitle(raw: string): string {
 }
 
 // YouTube channels commonly suffix artist names. Stripped before comparison.
-const YT_CHANNEL_SUFFIX = /\s*-?\s*(vevo|topic|official|music|records|tv)\s*$/i;
+// Two regexes: one for separator-prefixed suffixes ("Drake - Topic", "Queen Official"),
+// one for suffixes glued onto the artist name ("BeyoncéVEVO", "ArianaTopic"). The
+// glued variant is intentionally narrower (only the highest-precision platform
+// markers) to avoid mauling real artist names like "Music" or "Records".
+const YT_CHANNEL_SUFFIX_SPACED = /\s+-?\s*(vevo|topic|official|music|records|tv|channel|band)\s*$/i;
+const YT_CHANNEL_SUFFIX_GLUED = /(vevo|topic|official)$/i;
 
 export function normalizeArtists(raw: string[]): string[] {
   const out = new Set<string>();
@@ -68,11 +73,16 @@ export function normalizeArtists(raw: string[]): string[] {
     let s = a.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
     s = s.replace(/[‘’ʼ]/g, "'");
     s = s.replace(/[^\p{L}\p{N}\s\-']/gu, " ").replace(/\s+/g, " ").trim();
-    // Apply channel-suffix stripping repeatedly: "Beyoncé Official VEVO" -> "beyonce"
+    // Apply channel-suffix stripping repeatedly: "Beyoncé Official VEVO" -> "beyonce".
+    // First the spaced form (handles separator), then the glued form ("beyoncevevo").
     let prev = "";
     while (prev !== s) {
       prev = s;
-      s = s.replace(YT_CHANNEL_SUFFIX, "").trim();
+      s = s.replace(YT_CHANNEL_SUFFIX_SPACED, "").trim();
+      // Glued strip only when the remaining stem is long enough to not be the
+      // suffix itself (avoids reducing the channel literally named "VEVO" to "").
+      const glued = s.replace(YT_CHANNEL_SUFFIX_GLUED, "");
+      if (glued.length >= 3 && glued !== s) s = glued.trim();
     }
     if (s) out.add(s);
   }
@@ -158,6 +168,61 @@ export type ScoredCandidate = {
   durationScore: number;
 };
 
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Strip Spotify artist tokens from a (already-normalized) candidate title. The
+// common YouTube pattern is "Beyoncé - Halo (Official Video)" while Spotify
+// has just "Halo"; without this strip, fast-fuzzy compares "beyonce halo"
+// against "halo" and undershoots on shorter source titles. Multi-token artists
+// ("the rolling stones") are escaped and matched as a phrase before falling
+// back to per-token strips.
+export function stripArtistsFromTitle(
+  normalizedTitle: string,
+  normalizedArtists: string[],
+): string {
+  if (normalizedArtists.length === 0) return normalizedTitle;
+  let out = normalizedTitle;
+  for (const a of normalizedArtists) {
+    if (!a || a.length < 2) continue;
+    const phraseRe = new RegExp(
+      `(?:^|\\s|-)${escapeRegex(a)}(?=\\s|-|$)`,
+      "g",
+    );
+    out = out.replace(phraseRe, " ");
+  }
+  return out.replace(/\s+/g, " ").trim();
+}
+
+// "Does any spotify artist appear inside the YT-side text?" — rescues the
+// common case where the channelTitle Jaccard is 0 (e.g. "DailyMusic" channel,
+// or "BeyoncéVEVO" before the suffix strip) but the artist is literally
+// present in the YT title. Also accepts substring containment for length≥4
+// tokens so "beyonce" inside an unstrippable glob still scores.
+function artistTokenContainment(
+  spArtists: string[],
+  haystackText: string,
+): number {
+  if (spArtists.length === 0) return 0;
+  const tokens = new Set(
+    haystackText.split(/[\s\-]+/u).map((t) => t.trim()).filter(Boolean),
+  );
+  let hits = 0;
+  for (const a of spArtists) {
+    if (!a) continue;
+    if (tokens.has(a)) {
+      hits++;
+      continue;
+    }
+    if (a.length >= 4 && haystackText.includes(a)) {
+      hits++;
+      continue;
+    }
+  }
+  return hits / spArtists.length;
+}
+
 export function scoreCandidate(
   spotify: NormalizedTrack,
   candidate: NormalizedTrack,
@@ -167,13 +232,37 @@ export function scoreCandidate(
   // and a structural extraction corrupts more cases than it helps. Trust
   // the artists arrays as authoritative; let fast-fuzzy substring-match
   // the normalized titles.
-  const titleSim = titleSimilarity(
-    normalizeTitle(spotify.title),
-    normalizeTitle(candidate.title),
-  );
   const sArtists = normalizeArtists(spotify.artists);
   const cArtists = normalizeArtists(candidate.artists);
-  const artistJac = jaccard(sArtists, cArtists);
+
+  const spTitleNorm = normalizeTitle(spotify.title);
+  const ytTitleNorm = normalizeTitle(candidate.title);
+  // Strip the Spotify artist out of the YT title before fuzzy-comparing, so
+  // "beyonce halo" reduces to "halo" against a Spotify title of "halo".
+  // Fall back to the original title when the strip leaves nothing.
+  const ytTitleStripped = stripArtistsFromTitle(ytTitleNorm, sArtists) || ytTitleNorm;
+  const titleSim = titleSimilarity(spTitleNorm, ytTitleStripped);
+
+  // Artist signal: take the strongest of three signals.
+  //  - Jaccard of normalized artist tokens (current behavior).
+  //  - Containment in the channel text (catches "BeyoncéVEVO" cases the
+  //    suffix-strip didn't fully reduce).
+  //  - Containment in the YT title (catches fan-channel uploads where the
+  //    artist appears in the title but the channel is unrelated).
+  // Picking the max preserves bad-match rejection: an unrelated artist with
+  // unrelated title still scores 0.
+  const channelText = (candidate.artists[0] ?? "")
+    .normalize("NFKD")
+    .replace(/\p{M}/gu, "")
+    .toLowerCase();
+  const containInChannel = artistTokenContainment(sArtists, channelText);
+  const containInTitle = artistTokenContainment(sArtists, ytTitleNorm);
+  const artistJac = Math.max(
+    jaccard(sArtists, cArtists),
+    containInChannel,
+    containInTitle,
+  );
+
   const durScore = durationScore(spotify.durationMs, candidate.durationMs);
   const score = 0.5 * titleSim + 0.3 * artistJac + 0.2 * durScore;
   return {
